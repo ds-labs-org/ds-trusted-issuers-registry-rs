@@ -56,7 +56,7 @@ Public reads, no authentication:
 
 | Method and path | Returns |
 |---|---|
-| `GET /v1/issuers[?credentialType=T]` | `{version, total, items}`, optionally only records covering `T`. This is a listing, not an allow-list: it includes suspended and expired records, so use the trust check or the snapshot for decisions |
+| `GET /v1/issuers[?credentialType=T&role=R&status=S]` | `{version, total, items}`, optionally only records covering `T`, in role `R` (`root_tao`, `tao`, `ti`) and with status `S` (`active`, `suspended`, `revoked`); an unknown role or status is a 400. This is a listing, not an allow-list: it includes suspended and expired records, so use the trust check or the snapshot for decisions |
 | `GET /v1/issuers/{did}` | one record, or 404 |
 | `GET /v1/issuers/{did}/types/{type}` | `{trusted, chain, reason?}` for that issuer and type, now |
 | `GET /v1/snapshot` | the whole registry as a signed JWS (`application/trust-list+jwt`) |
@@ -67,6 +67,7 @@ Authority writes, behind `Authorization: Bearer <admin token>`:
 
 | Method and path | Effect |
 |---|---|
+| `GET /v1/admin` | 204 when the token would be accepted, else the same 401/403 a write gets; lets a console show itself read-only |
 | `PUT /v1/issuers/{did}` | create (201) or replace (200) a record; a body `did` is optional but must match the path |
 | `PATCH /v1/issuers/{did}/status` | `{"status": "suspended"}` and so on |
 | `DELETE /v1/issuers/{did}` | remove (204); 409 while it still accredits someone |

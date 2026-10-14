@@ -5,8 +5,8 @@
 //! - `GET /health`
 //! - `GET /.well-known/did.json` - the registry's own `did:web` document,
 //!   holding the key that signs snapshots
-//! - `GET /v1/issuers[?credentialType=T]` - every record, optionally only
-//!   those scoped for `T` (a listing, not an allow-list: suspended or
+//! - `GET /v1/issuers[?credentialType=T&role=R&status=S]` - every record,
+//!   optionally only those scoped for `T`, in role `R`, with status `S` (a listing, not an allow-list: suspended or
 //!   expired records are included - use the trust check for decisions)
 //! - `GET /v1/issuers/{did}` - one record
 //! - `GET /v1/issuers/{did}/types/{type}` - the accreditation-chain trust
@@ -19,6 +19,8 @@
 //! runs before the request body is read, so unauthenticated callers only
 //! ever see 401/403:
 //!
+//! - `GET /v1/admin` - `204` when the presented token would be accepted, so
+//!   a console can show itself read-only before offering writes
 //! - `PUT /v1/issuers/{did}` - create or replace a record
 //! - `PATCH /v1/issuers/{did}/status` - `{"status": "suspended"}` etc.
 //! - `DELETE /v1/issuers/{did}`
@@ -86,6 +88,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let admin = Router::new()
         .route("/v1/issuers/{did}", put(put_issuer).delete(delete_issuer))
         .route("/v1/issuers/{did}/status", patch(patch_status))
+        .route("/v1/admin", get(|| async { StatusCode::NO_CONTENT }))
         .route_layer(from_fn_with_state(state.clone(), require_admin));
     Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -256,6 +259,8 @@ async fn did_document(State(state): State<Arc<AppState>>) -> Json<serde_json::Va
 #[serde(rename_all = "camelCase")]
 struct ListQuery {
     credential_type: Option<String>,
+    role: Option<Role>,
+    status: Option<Status>,
 }
 
 async fn list_issuers(
@@ -266,6 +271,8 @@ async fn list_issuers(
     let items: Vec<&IssuerRecord> = registry
         .list()
         .filter(|r| query.credential_type.as_deref().is_none_or(|t| r.covers(t)))
+        .filter(|r| query.role.is_none_or(|role| r.role == role))
+        .filter(|r| query.status.is_none_or(|status| r.status == status))
         .collect();
     Json(json!({"version": registry.version, "total": items.len(), "items": items}))
 }
