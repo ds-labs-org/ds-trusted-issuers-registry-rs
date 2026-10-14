@@ -1,0 +1,29 @@
+[package]
+name = "trusted-issuers-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "axum HTTP surface and binary for the trusted issuers registry: public read API, signed snapshot, did:web document, and the authority's admin API."
+
+[[bin]]
+name = "trusted-issuers-registry"
+path = "src/main.rs"
+
+[dependencies]
+trusted-issuers-core = { path = "../trusted-issuers-core" }
+ds-dcp-core-rs = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+p256 = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
