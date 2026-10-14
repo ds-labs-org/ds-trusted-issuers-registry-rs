@@ -426,3 +426,65 @@ async fn a_data_file_named_tmp_is_still_written_atomically() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn list_filters_by_role_and_status() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{TI_PATH}/status"),
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let dids = |body: &Value| -> Vec<String> {
+        let mut dids: Vec<String> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["did"].as_str().unwrap().to_string())
+            .collect();
+        dids.sort();
+        dids
+    };
+
+    // What the console's "accredited by" picker asks for.
+    let (_, body, _) = call(&s, "GET", "/v1/issuers?role=tao", None, None).await;
+    assert_eq!(dids(&body), vec![TAO]);
+    assert_eq!(body["total"], 1);
+    let (_, body, _) = call(&s, "GET", "/v1/issuers?status=active", None, None).await;
+    assert_eq!(dids(&body), vec![ROOT, TAO]);
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        "/v1/issuers?role=ti&status=suspended&credentialType=MembershipCredential",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(dids(&body), vec![TI]);
+    let (_, body, _) = call(&s, "GET", "/v1/issuers?role=ti&status=active", None, None).await;
+    assert_eq!(body["total"], 0);
+
+    let (status, _, _) = call(&s, "GET", "/v1/issuers?role=bogus", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_probe_reports_whether_writes_are_allowed() {
+    let s = state(Some(TOKEN), None);
+    let (status, _, _) = call(&s, "GET", "/v1/admin", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for token in [None, Some("wrong")] {
+        let (status, body, _) = call(&s, "GET", "/v1/admin", token, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body["error"].is_string());
+    }
+    let disabled = state(None, None);
+    let (status, _, _) = call(&disabled, "GET", "/v1/admin", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
