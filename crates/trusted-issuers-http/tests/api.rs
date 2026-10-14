@@ -9,7 +9,6 @@ use axum::http::{Request, StatusCode, header};
 use dcp_core::{DcpKeyPair, find_verifying_key};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
 use tower::ServiceExt;
 use trusted_issuers_core::{snapshot_kid, verify_snapshot};
 use trusted_issuers_http::{AppState, SNAPSHOT_CONTENT_TYPE, load, router};
@@ -23,13 +22,13 @@ const TI_PATH: &str = "did:web:issuer.example%253A8443";
 const TOKEN: &str = "s3cret";
 
 fn state(admin_token: Option<&str>, data_file: Option<std::path::PathBuf>) -> Arc<AppState> {
-    Arc::new(AppState {
-        registry: RwLock::new(Default::default()),
-        key: DcpKeyPair::generate(REGISTRY_DID.into()),
-        admin_token: admin_token.map(Into::into),
+    Arc::new(AppState::new(
+        Default::default(),
+        DcpKeyPair::generate(REGISTRY_DID.into()),
+        admin_token.map(Into::into),
         data_file,
-        snapshot_ttl_secs: 600,
-    })
+        600,
+    ))
 }
 
 async fn call(
@@ -161,12 +160,10 @@ async fn snapshot_verifies_against_the_registry_did_document() {
     let (_, doc, _) = call(&s, "GET", "/.well-known/did.json", None, None).await;
     let doc = serde_json::from_value(doc).unwrap();
     let key = find_verifying_key(&doc, &snapshot_kid(token).unwrap()).unwrap();
-    let (payload, registry) =
-        verify_snapshot(token, REGISTRY_DID, &key, dcp_core::now_secs()).unwrap();
-    assert_eq!(payload.version, 3);
+    let list = verify_snapshot(token, REGISTRY_DID, &key, dcp_core::now_secs()).unwrap();
+    assert_eq!(list.version, 3);
     assert!(
-        registry
-            .check(TI, "MembershipCredential", dcp_core::now_secs())
+        list.check(TI, "MembershipCredential", dcp_core::now_secs())
             .trusted
     );
 }
@@ -270,7 +267,7 @@ async fn writes_are_persisted_and_reloaded() {
 
     let s = state(Some(TOKEN), Some(file.clone()));
     seed(&s).await;
-    let reloaded = load(&file).unwrap();
+    let reloaded = load(&file, false).unwrap();
     assert_eq!(reloaded, *s.registry.read().await);
     assert_eq!(reloaded.version, 3);
 
@@ -290,5 +287,142 @@ async fn writes_are_persisted_and_reloaded() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(blocked.registry.read().await.version, 0);
 
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn an_empty_admin_token_disables_the_admin_api() {
+    let body = json!({"role": "root_tao", "credentialTypes": ["*"], "status": "active"});
+    for empty in ["", "  "] {
+        let s = state(Some(empty), None);
+        for token in [None, Some(""), Some(empty)] {
+            let (status, _, _) = call(
+                &s,
+                "PUT",
+                &format!("/v1/issuers/{ROOT}"),
+                token,
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+    }
+}
+
+#[tokio::test]
+async fn auth_runs_before_the_body_is_read() {
+    let s = state(Some(TOKEN), None);
+    // No content type, and a body that isn't valid for the route: still 401.
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/v1/issuers/{ROOT}"))
+        .body(Body::from("not json"))
+        .unwrap();
+    let resp = router(s.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{ROOT}/status"),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The scheme is case-insensitive (RFC 7235).
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/v1/issuers/{ROOT}"))
+        .header(header::AUTHORIZATION, format!("bearer {TOKEN}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"role": "root_tao", "credentialTypes": ["*"], "status": "active"}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router(s).oneshot(req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn put_bodies_are_strict() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    // A misspelled expiry must not silently create a never-expiring issuer.
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        "/v1/issuers/did:web:x.example",
+        Some(TOKEN),
+        Some(json!({"role": "ti", "credentialTypes": ["MembershipCredential"], "accreditedBy": TAO, "status": "active", "valid_until": 1000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("valid_until"));
+    for not_an_object in [json!([]), json!(1), json!("x")] {
+        let (status, _, _) = call(
+            &s,
+            "PUT",
+            "/v1/issuers/did:web:x.example",
+            Some(TOKEN),
+            Some(not_an_object),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    // A GET response (with updatedAt) can be PUT back unchanged.
+    let (_, record, _) = call(&s, "GET", &format!("/v1/issuers/{TAO}"), None, None).await;
+    let (status, _, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{TAO}"),
+        Some(TOKEN),
+        Some(record),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn load_refuses_missing_and_rule_breaking_files() {
+    let dir = std::env::temp_dir().join(format!("tir-load-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("registry.json");
+    let _ = std::fs::remove_file(&file);
+    assert!(load(&file, false).is_err());
+    assert_eq!(load(&file, true).unwrap().version, 0);
+
+    std::fs::write(
+        &file,
+        json!({"version": 1, "issuers": [
+            {"did": ROOT, "role": "root_tao", "credentialTypes": ["*"], "status": "active"},
+            {"did": TI, "role": "ti", "credentialTypes": ["*"], "accreditedBy": ROOT, "status": "active"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    assert!(load(&file, false).unwrap_err().contains("'*'"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_data_file_named_tmp_is_still_written_atomically() {
+    let dir = std::env::temp_dir().join(format!("tir-tmp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("registry.tmp");
+    let _ = std::fs::remove_file(&file);
+    let s = state(Some(TOKEN), Some(file.clone()));
+    seed(&s).await;
+    assert_eq!(load(&file, false).unwrap().version, 3);
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n != "registry.tmp")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }

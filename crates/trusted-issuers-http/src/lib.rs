@@ -6,7 +6,8 @@
 //! - `GET /.well-known/did.json` - the registry's own `did:web` document,
 //!   holding the key that signs snapshots
 //! - `GET /v1/issuers[?credentialType=T]` - every record, optionally only
-//!   those scoped for `T`
+//!   those scoped for `T` (a listing, not an allow-list: suspended or
+//!   expired records are included - use the trust check for decisions)
 //! - `GET /v1/issuers/{did}` - one record
 //! - `GET /v1/issuers/{did}/types/{type}` - the accreditation-chain trust
 //!   decision for `did` issuing `type`, right now
@@ -14,7 +15,9 @@
 //!   (`application/trust-list+jwt`)
 //!
 //! Authority-only writes, behind `Authorization: Bearer <admin token>`
-//! (disabled entirely when no admin token is configured):
+//! (disabled entirely when no admin token is configured). Authorization
+//! runs before the request body is read, so unauthenticated callers only
+//! ever see 401/403:
 //!
 //! - `PUT /v1/issuers/{did}` - create or replace a record
 //! - `PATCH /v1/issuers/{did}/status` - `{"status": "suspended"}` etc.
@@ -23,67 +26,133 @@
 //! DIDs go in the path percent-encoded as one segment, so a `did:web` with a
 //! port (`did:web:host%3A8080`) is sent as `did:web:host%253A8080`.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, put};
 use axum::{Json, Router};
 use dcp_core::{DcpKeyPair, now_secs};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
-use trusted_issuers_core::{IssuerRecord, Registry, RegistryError, Status, sign_snapshot};
+use trusted_issuers_core::{IssuerRecord, Registry, RegistryError, Role, Status, sign_snapshot};
 
 pub const SNAPSHOT_CONTENT_TYPE: &str = "application/trust-list+jwt";
 
 pub struct AppState {
     pub registry: RwLock<Registry>,
     pub key: DcpKeyPair,
-    /// `None` disables the admin API (every write is refused).
-    pub admin_token: Option<String>,
+    /// `None` disables the admin API (every write is refused). Never
+    /// `Some("")`: [`AppState::new`] maps an empty token to `None`.
+    admin_token: Option<String>,
     /// Where the registry is persisted after each write; `None` keeps it in
     /// memory only.
     pub data_file: Option<PathBuf>,
     pub snapshot_ttl_secs: u64,
 }
 
+impl AppState {
+    /// An empty or whitespace-only `admin_token` is treated as no token, so
+    /// an unset secret (`TOKEN=`) disables the admin API instead of making
+    /// the empty string the password.
+    pub fn new(
+        registry: Registry,
+        key: DcpKeyPair,
+        admin_token: Option<String>,
+        data_file: Option<PathBuf>,
+        snapshot_ttl_secs: u64,
+    ) -> Self {
+        Self {
+            registry: RwLock::new(registry),
+            key,
+            admin_token: admin_token.filter(|t| !t.trim().is_empty()),
+            data_file,
+            snapshot_ttl_secs,
+        }
+    }
+
+    pub fn admin_enabled(&self) -> bool {
+        self.admin_token.is_some()
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
+    let admin = Router::new()
+        .route("/v1/issuers/{did}", put(put_issuer).delete(delete_issuer))
+        .route("/v1/issuers/{did}/status", patch(patch_status))
+        .route_layer(from_fn_with_state(state.clone(), require_admin));
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/.well-known/did.json", get(did_document))
         .route("/v1/issuers", get(list_issuers))
-        .route(
-            "/v1/issuers/{did}",
-            get(get_issuer).put(put_issuer).delete(delete_issuer),
-        )
-        .route("/v1/issuers/{did}/status", patch(patch_status))
+        .route("/v1/issuers/{did}", get(get_issuer))
         .route(
             "/v1/issuers/{did}/types/{credential_type}",
             get(check_trust),
         )
         .route("/v1/snapshot", get(snapshot))
+        .merge(admin)
         .with_state(state)
 }
 
-/// Loads a registry persisted by [`persist`]; a missing file is an empty
+/// Loads a registry persisted by [`persist`] and re-checks it against the
+/// write rules, so a hand-edited file can't smuggle in what the API would
+/// refuse. A missing file is an error unless `create_if_missing`, so an
+/// unmounted volume or a mistyped path doesn't silently serve an empty
 /// registry.
-pub fn load(path: &std::path::Path) -> Result<Registry, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Registry::default()),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
+pub fn load(path: &FsPath, create_if_missing: bool) -> Result<Registry, String> {
+    let registry: Registry = match std::fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
+            return Ok(Registry::default());
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    registry
+        .revalidated()
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Writes the registry to `path` via a temp file and rename, so a crash
-/// mid-write never leaves a truncated file.
-pub fn persist(path: &std::path::Path, registry: &Registry) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(registry)?)?;
-    std::fs::rename(tmp, path)
+/// Writes the registry to `path` atomically and durably: a uniquely named
+/// temp file in the same directory (created exclusively, so a planted file
+/// or symlink is never written through), fsynced, renamed over `path`,
+/// then the directory fsynced so the rename survives a power loss.
+pub fn persist(path: &FsPath, registry: &Registry) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => FsPath::new("."),
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("data file path has no file name"))?
+        .to_string_lossy();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(registry)?)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// A JSON `{"error": ...}` response, kept small so `Result<_, ApiError>`
@@ -115,25 +184,32 @@ fn registry_error(err: RegistryError) -> ApiError {
     error(status, err.to_string())
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+/// Admin-route middleware: runs before any extractor, so the body is never
+/// read for an unauthorized caller.
+async fn require_admin(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let Some(expected) = state.admin_token.as_deref() else {
-        return Err(error(
+        return error(
             StatusCode::FORBIDDEN,
             "the admin API is disabled: no admin token is configured",
-        ));
+        )
+        .into_response();
     };
-    let presented = headers
+    let presented = request
+        .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim())
         .unwrap_or_default();
-    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-        Ok(())
+    if !presented.is_empty() && constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        next.run(request).await
     } else {
-        Err(error(
-            StatusCode::UNAUTHORIZED,
-            "missing or wrong admin token",
-        ))
+        error(StatusCode::UNAUTHORIZED, "missing or wrong admin token").into_response()
     }
 }
 
@@ -143,7 +219,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Applies a write to a copy of the registry, persists the copy, and only
 /// then makes it live, so memory and disk never disagree after a failed
-/// write. Writes are rare, so copying the registry is cheap enough.
+/// write. Writes are rare, so copying the registry is cheap enough. Disk
+/// I/O runs on the blocking pool; the write lock is held across it, which
+/// serializes writes (readers wait for at most one fsync).
 async fn apply(
     state: &AppState,
     write: impl FnOnce(&mut Registry) -> Result<(), RegistryError>,
@@ -151,14 +229,20 @@ async fn apply(
     let mut registry = state.registry.write().await;
     let mut next = registry.clone();
     write(&mut next).map_err(registry_error)?;
-    if let Some(path) = &state.data_file
-        && let Err(e) = persist(path, &next)
-    {
-        tracing::error!("failed to persist registry to {}: {e}", path.display());
-        return Err(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the registry could not be persisted; nothing was changed",
-        ));
+    if let Some(path) = state.data_file.clone() {
+        let to_save = next.clone();
+        let result =
+            tokio::task::spawn_blocking(move || persist(&path, &to_save).map_err(|e| (path, e)))
+                .await
+                .map_err(|e| (PathBuf::new(), std::io::Error::other(e)))
+                .and_then(|r| r);
+        if let Err((path, e)) = result {
+            tracing::error!("failed to persist registry to {}: {e}", path.display());
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the registry could not be persisted; nothing was changed",
+            ));
+        }
     }
     *registry = next.clone();
     Ok(next)
@@ -216,12 +300,15 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> Response {
         now_secs(),
         state.snapshot_ttl_secs,
     );
+    // Shared caches may hold it for a quarter of its lifetime at most, so a
+    // verifier never receives a nearly expired snapshot and a revocation
+    // reaches verifiers within ~1.25 TTL.
     (
         [
             (header::CONTENT_TYPE, SNAPSHOT_CONTENT_TYPE.to_string()),
             (
                 header::CACHE_CONTROL,
-                format!("public, max-age={}", state.snapshot_ttl_secs),
+                format!("public, max-age={}", state.snapshot_ttl_secs / 4),
             ),
         ],
         token,
@@ -229,27 +316,49 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
+/// The PUT body. Unlike the core [`IssuerRecord`] (kept lenient so newer
+/// snapshots still parse), it rejects unknown fields: a misspelled
+/// `validUntil` must fail loudly, not silently create a record that never
+/// expires.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PutBody {
+    /// Optional; must match the path when given.
+    did: Option<String>,
+    role: Role,
+    name: Option<String>,
+    credential_types: Vec<String>,
+    accredited_by: Option<String>,
+    valid_from: Option<u64>,
+    valid_until: Option<u64>,
+    status: Status,
+    /// Accepted so a GET response can be PUT back; always overwritten.
+    #[serde(rename = "updatedAt")]
+    _updated_at: Option<u64>,
+}
+
 async fn put_issuer(
     State(state): State<Arc<AppState>>,
     Path(did): Path<String>,
-    headers: HeaderMap,
-    Json(mut body): Json<serde_json::Value>,
+    body: Result<Json<PutBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if let Err(r) = authorize(&state, &headers) {
-        return r.into_response();
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    if body.did.as_deref().is_some_and(|d| d != did) {
+        return error(StatusCode::BAD_REQUEST, "body did does not match the path").into_response();
     }
-    // The path names the record; a body `did` is optional but must agree.
-    match body.get("did") {
-        None => body["did"] = json!(did),
-        Some(v) if v == &json!(did) => {}
-        Some(_) => {
-            return error(StatusCode::BAD_REQUEST, "body did does not match the path")
-                .into_response();
-        }
-    }
-    let record: IssuerRecord = match serde_json::from_value(body) {
-        Ok(r) => r,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    let record = IssuerRecord {
+        did: did.clone(),
+        role: body.role,
+        name: body.name,
+        credential_types: body.credential_types,
+        accredited_by: body.accredited_by,
+        valid_from: body.valid_from,
+        valid_until: body.valid_until,
+        status: body.status,
+        updated_at: 0,
     };
     let mut created = false;
     let result = apply(&state, |registry| {
@@ -271,6 +380,7 @@ async fn put_issuer(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StatusBody {
     status: Status,
 }
@@ -278,12 +388,12 @@ struct StatusBody {
 async fn patch_status(
     State(state): State<Arc<AppState>>,
     Path(did): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<StatusBody>,
+    body: Result<Json<StatusBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if let Err(r) = authorize(&state, &headers) {
-        return r.into_response();
-    }
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
     match apply(&state, |registry| {
         registry.set_status(&did, body.status, now_secs())
     })
@@ -294,14 +404,7 @@ async fn patch_status(
     }
 }
 
-async fn delete_issuer(
-    State(state): State<Arc<AppState>>,
-    Path(did): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(r) = authorize(&state, &headers) {
-        return r.into_response();
-    }
+async fn delete_issuer(State(state): State<Arc<AppState>>, Path(did): Path<String>) -> Response {
     match apply(&state, |registry| registry.remove(&did).map(drop)).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(r) => r.into_response(),

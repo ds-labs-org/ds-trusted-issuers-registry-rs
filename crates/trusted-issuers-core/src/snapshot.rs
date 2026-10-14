@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::IssuerRecord;
-use crate::registry::Registry;
+use crate::registry::{Registry, TrustDecision};
 
 /// `typ` header value, so a snapshot can't be confused with another JWS
 /// the same key signs.
@@ -79,8 +79,41 @@ fn sign_with_typ(payload: &serde_json::Value, key: &DcpKeyPair) -> String {
     format!("{signing_input}.{}", b64_encode(signature.to_bytes()))
 }
 
-/// Verifies a snapshot from the registry `expected_iss` and returns its
-/// contents as a [`Registry`] that answers [`Registry::check`] locally.
+/// A verified snapshot. [`TrustList::check`] answers like
+/// [`Registry::check`] but refuses everything once the snapshot expires, so
+/// a verifier that keeps one around can't keep trusting a stale list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustList {
+    pub iss: String,
+    pub iat: u64,
+    pub exp: u64,
+    pub version: u64,
+    registry: Registry,
+}
+
+impl TrustList {
+    pub fn check(&self, did: &str, credential_type: &str, now: u64) -> TrustDecision {
+        if now >= self.exp {
+            return TrustDecision {
+                trusted: false,
+                chain: vec![],
+                reason: Some(format!(
+                    "the trust list expired at {}; fetch a new snapshot",
+                    self.exp
+                )),
+            };
+        }
+        self.registry.check(did, credential_type, now)
+    }
+
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+}
+
+/// Verifies a snapshot from the registry `expected_iss` and returns it as a
+/// [`TrustList`] that answers trust checks locally until it expires. The
+/// contents are re-checked against the registry's write rules too.
 ///
 /// `verifying_key` is the registry's key, normally looked up with
 /// `dcp_core::find_verifying_key` on its resolved DID document using the
@@ -90,7 +123,7 @@ pub fn verify_snapshot(
     expected_iss: &str,
     verifying_key: &VerifyingKey,
     now: u64,
-) -> Result<(SnapshotPayload, Registry), SnapshotError> {
+) -> Result<TrustList, SnapshotError> {
     let (_, header, payload) = decode_jws_unverified(token).map_err(SnapshotError::Malformed)?;
     if header["alg"] != "ES256" || header["typ"] != SNAPSHOT_TYP {
         return Err(SnapshotError::WrongHeader);
@@ -108,15 +141,28 @@ pub fn verify_snapshot(
     if now >= payload.exp {
         return Err(SnapshotError::Expired(payload.exp));
     }
+    let mut issuers = std::collections::BTreeMap::new();
+    for record in payload.issuers {
+        let did = record.did.clone();
+        if issuers.insert(did.clone(), record).is_some() {
+            return Err(SnapshotError::Malformed(format!(
+                "'{did}' is listed more than once"
+            )));
+        }
+    }
     let registry = Registry {
         version: payload.version,
-        issuers: payload
-            .issuers
-            .iter()
-            .map(|r| (r.did.clone(), r.clone()))
-            .collect(),
-    };
-    Ok((payload, registry))
+        issuers,
+    }
+    .revalidated()
+    .map_err(|e| SnapshotError::Malformed(e.to_string()))?;
+    Ok(TrustList {
+        iss: payload.iss,
+        iat: payload.iat,
+        exp: payload.exp,
+        version: payload.version,
+        registry,
+    })
 }
 
 /// The `kid` header of a snapshot, without verifying it, so the caller can
@@ -165,11 +211,17 @@ mod tests {
         let key = DcpKeyPair::generate(REGISTRY_DID.into());
         let token = sign_snapshot(&registry(), &key, 1000, 60);
         assert_eq!(snapshot_kid(&token).unwrap(), key.own_key_id);
-        let (payload, back) = verify_snapshot(&token, REGISTRY_DID, &vk(&key), 1059).unwrap();
-        assert_eq!(payload.exp, 1060);
-        assert_eq!(back, registry());
+        let list = verify_snapshot(&token, REGISTRY_DID, &vk(&key), 1059).unwrap();
+        assert_eq!(list.exp, 1060);
+        assert_eq!(list.registry(), &registry());
         assert!(
-            back.check("did:web:authority.example", "Anything", 1059)
+            list.check("did:web:authority.example", "Anything", 1059)
+                .trusted
+        );
+        // A kept TrustList stops trusting anyone once it expires.
+        assert!(
+            !list
+                .check("did:web:authority.example", "Anything", 1060)
                 .trusted
         );
     }

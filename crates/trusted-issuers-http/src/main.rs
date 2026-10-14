@@ -6,7 +6,6 @@ use clap::Parser;
 use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
-use tokio::sync::RwLock;
 use trusted_issuers_http::{AppState, load, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
@@ -36,6 +35,12 @@ struct Cli {
     #[arg(long)]
     data_file: Option<PathBuf>,
 
+    /// Start with an empty registry when `--data-file` doesn't exist yet.
+    /// Without it a missing file is a startup error, so an unmounted volume
+    /// can't silently serve an empty list.
+    #[arg(long)]
+    create_data_file: bool,
+
     /// Bearer token for the admin (write) API. Without it the admin API is
     /// disabled. Prefer the environment variable over the flag, so the
     /// token stays out of process listings.
@@ -43,8 +48,37 @@ struct Cli {
     admin_token: Option<String>,
 
     /// How long a signed snapshot stays valid, in seconds.
-    #[arg(long, default_value_t = 3600)]
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
     snapshot_ttl_secs: u64,
+}
+
+/// `host` or `host:port`, lowercased: DNS labels of `[a-z0-9-]` and an
+/// optional numeric port. Anything else would produce a `did:web` nobody
+/// can resolve, so it is refused at startup.
+fn did_from_host(host: &str) -> Result<String, String> {
+    let host = host.trim().to_ascii_lowercase();
+    let (name, port) = match host.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host.as_str(), None),
+    };
+    let name_ok = !name.is_empty()
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        });
+    let port_ok = port.is_none_or(|p| p.parse::<u16>().is_ok_and(|p| p > 0));
+    if !name_ok || !port_ok {
+        return Err(format!(
+            "--did-host '{host}' must be a host name with an optional port, e.g. registry.example or localhost:8090"
+        ));
+    }
+    Ok(match port {
+        Some(port) => format!("did:web:{name}%3A{port}"),
+        None => format!("did:web:{name}"),
+    })
 }
 
 fn key_pair(did: String, signing_key: SigningKey) -> DcpKeyPair {
@@ -69,7 +103,7 @@ async fn main() -> Result<(), String> {
         .init();
     let cli = Cli::parse();
 
-    let did = format!("did:web:{}", cli.did_host.replace(':', "%3A"));
+    let did = did_from_host(&cli.did_host)?;
     let key = match &cli.signing_key_file {
         Some(path) => {
             let pem =
@@ -89,13 +123,10 @@ async fn main() -> Result<(), String> {
         }
     };
 
-    let registry = match &cli.data_file {
-        Some(path) => load(path)?,
+    let registry: trusted_issuers_core::Registry = match &cli.data_file {
+        Some(path) => load(path, cli.create_data_file)?,
         None => Default::default(),
     };
-    if cli.admin_token.is_none() {
-        tracing::warn!("no admin token configured: the admin API is disabled");
-    }
     tracing::info!(
         did = %key.own_did,
         issuers = registry.issuers.len(),
@@ -104,13 +135,16 @@ async fn main() -> Result<(), String> {
         cli.bind
     );
 
-    let state = Arc::new(AppState {
-        registry: RwLock::new(registry),
+    let state = Arc::new(AppState::new(
+        registry,
         key,
-        admin_token: cli.admin_token,
-        data_file: cli.data_file,
-        snapshot_ttl_secs: cli.snapshot_ttl_secs,
-    });
+        cli.admin_token,
+        cli.data_file,
+        cli.snapshot_ttl_secs,
+    ));
+    if !state.admin_enabled() {
+        tracing::warn!("no (or an empty) admin token configured: the admin API is disabled");
+    }
     let listener = tokio::net::TcpListener::bind(cli.bind)
         .await
         .map_err(|e| format!("bind {}: {e}", cli.bind))?;
@@ -120,4 +154,33 @@ async fn main() -> Result<(), String> {
         })
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::did_from_host;
+
+    #[test]
+    fn did_host_is_validated() {
+        assert_eq!(
+            did_from_host("Registry.Example").unwrap(),
+            "did:web:registry.example"
+        );
+        assert_eq!(
+            did_from_host("localhost:8090").unwrap(),
+            "did:web:localhost%3A8090"
+        );
+        for bad in [
+            "",
+            "https://registry.example",
+            "a/b",
+            "host:",
+            "host:0",
+            "host:99999",
+            "-a.example",
+            "a..b",
+        ] {
+            assert!(did_from_host(bad).is_err(), "{bad}");
+        }
+    }
 }

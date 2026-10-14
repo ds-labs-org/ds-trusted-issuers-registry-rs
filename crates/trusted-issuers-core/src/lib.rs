@@ -10,5 +10,6 @@ pub mod snapshot;
 pub use model::{ANY_CREDENTIAL_TYPE, IssuerRecord, Role, Status};
 pub use registry::{MAX_CHAIN_DEPTH, Registry, RegistryError, TrustDecision};
 pub use snapshot::{
-    SNAPSHOT_TYP, SnapshotError, SnapshotPayload, sign_snapshot, snapshot_kid, verify_snapshot,
+    SNAPSHOT_TYP, SnapshotError, SnapshotPayload, TrustList, sign_snapshot, snapshot_kid,
+    verify_snapshot,
 };

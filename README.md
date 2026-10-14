@@ -46,7 +46,8 @@ suspending or narrowing a TAO immediately distrusts everything it
 accredited.
 
 **Write rules.** The accreditor must exist and be able to accredit, cover
-the child's types, and not close a cycle. A record that still accredits
+the child's types, and not close a cycle or make a chain longer than 8
+links. A record that still accredits
 others can't be removed or demoted to `ti`. Failed writes change nothing.
 
 ## API
@@ -55,7 +56,7 @@ Public reads, no authentication:
 
 | Method and path | Returns |
 |---|---|
-| `GET /v1/issuers[?credentialType=T]` | `{version, total, items}`, optionally only records covering `T` |
+| `GET /v1/issuers[?credentialType=T]` | `{version, total, items}`, optionally only records covering `T`. This is a listing, not an allow-list: it includes suspended and expired records, so use the trust check or the snapshot for decisions |
 | `GET /v1/issuers/{did}` | one record, or 404 |
 | `GET /v1/issuers/{did}/types/{type}` | `{trusted, chain, reason?}` for that issuer and type, now |
 | `GET /v1/snapshot` | the whole registry as a signed JWS (`application/trust-list+jwt`) |
@@ -70,14 +71,19 @@ Authority writes, behind `Authorization: Bearer <admin token>`:
 | `PATCH /v1/issuers/{did}/status` | `{"status": "suspended"}` and so on |
 | `DELETE /v1/issuers/{did}` | remove (204); 409 while it still accredits someone |
 
-Rule violations return 422, unknown DIDs 404. A DID goes in the path as one
+Authorization is checked before the body is read, so an unauthenticated
+caller only ever gets 401 (or 403 when the admin API is disabled). Bodies
+with unknown fields (such as a misspelled `validUntil`) are refused with 400.
+Rule violations return 422, removing or demoting a record that still
+accredits others returns 409, and unknown DIDs return 404. A DID goes in the path as one
 percent-encoded segment, so `did:web:host%3A8443` is sent as
 `did:web:host%253A8443`.
 
 The admin API is meant to sit behind the same OIDC gateway (apisix +
 Zitadel) as `ds-authority-governance-ui`, which will get a "Trusted
 Issuers" view on top of it. The admin token is the service-to-service
-credential behind that gateway; without one the admin API is disabled.
+credential behind that gateway. Without one, or with an empty one, the
+admin API is disabled.
 
 ### Signed snapshot
 
@@ -92,7 +98,10 @@ with header `{"alg": "ES256", "typ": "trust-list+jwt", "kid": "<registry DID>#re
 A verifier fetches it once, verifies it against the key in the registry's
 DID document, and answers trust checks locally until `exp`, with no call to
 the registry per credential. `version` increases on every write, so a
-verifier can tell whether its copy is stale. `trusted-issuers-core` has no
+verifier can tell whether its copy is stale. `verify_snapshot` also
+re-applies the write rules to the contents. Responses carry
+`Cache-Control: max-age` of a quarter of the TTL, so shared caches never
+hand out a nearly expired snapshot. `trusted-issuers-core` has no
 network code, so a verifier can embed it directly (sketch, error handling
 elided):
 
@@ -100,8 +109,9 @@ elided):
 use trusted_issuers_core::{snapshot_kid, verify_snapshot};
 
 let key = dcp_core::find_verifying_key(&registry_did_doc, &snapshot_kid(&token)?)?;
-let (_, registry) = verify_snapshot(&token, registry_did, &key, dcp_core::now_secs())?;
-let decision = registry.check(issuer_did, "MembershipCredential", dcp_core::now_secs());
+let trust_list = verify_snapshot(&token, registry_did, &key, dcp_core::now_secs())?;
+// Keep `trust_list` around; it refuses every check once the snapshot expires.
+let decision = trust_list.check(issuer_did, "MembershipCredential", dcp_core::now_secs());
 ```
 
 ## Crates
@@ -131,7 +141,7 @@ TRUSTED_ISSUERS_ADMIN_TOKEN=change-me \
 cargo run -p trusted-issuers-http --bin trusted-issuers-registry -- \
   --did-host localhost:8090 \
   --signing-key-file registry-key.pem \
-  --data-file registry.json
+  --data-file registry.json --create-data-file
 ```
 
 | Flag | Default | Meaning |
@@ -139,9 +149,10 @@ cargo run -p trusted-issuers-http --bin trusted-issuers-registry -- \
 | `--bind` | `0.0.0.0:8090` | listen address |
 | `--did-host` | required | host the registry's `did:web` resolves to |
 | `--signing-key-file` | ephemeral key | PKCS#8 PEM P-256 key that signs snapshots |
-| `--data-file` | in memory | JSON file loaded at start and rewritten (atomically) after each write |
+| `--data-file` | in memory | JSON file loaded at start (and re-checked against the write rules) and rewritten atomically and durably after each write |
+| `--create-data-file` | off | start empty when `--data-file` doesn't exist yet; otherwise a missing file is a startup error |
 | `--admin-token` / `TRUSTED_ISSUERS_ADMIN_TOKEN` | disabled | bearer token for the admin API |
-| `--snapshot-ttl-secs` | `3600` | snapshot lifetime |
+| `--snapshot-ttl-secs` | `3600` | snapshot lifetime, at least 1 |
 
 ## Not done yet
 

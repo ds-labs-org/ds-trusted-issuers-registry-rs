@@ -44,6 +44,10 @@ pub enum RegistryError {
     },
     #[error("accreditedBy '{0}' would create an accreditation cycle")]
     Cycle(String),
+    #[error("the accreditation chain would be longer than {MAX_CHAIN_DEPTH} links")]
+    ChainTooLong,
+    #[error("'{0}' is listed more than once")]
+    Duplicate(String),
     #[error("'{did}' still accredits {dependents:?}; reassign or remove them first")]
     HasDependents {
         did: String,
@@ -145,6 +149,55 @@ impl Registry {
         Ok(removed)
     }
 
+    /// Longest line of records below `did` (0 when nothing names it as
+    /// accreditor). Stops counting past [`MAX_CHAIN_DEPTH`].
+    fn descendant_height(&self, did: &str, depth: usize) -> usize {
+        if depth > MAX_CHAIN_DEPTH {
+            return depth;
+        }
+        self.issuers
+            .values()
+            .filter(|r| r.accredited_by.as_deref() == Some(did))
+            .map(|r| 1 + self.descendant_height(&r.did, depth + 1))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Re-applies every write rule to a registry that did not come through
+    /// [`Registry::upsert`] (a data file loaded from disk, a snapshot),
+    /// inserting accreditors before the records they accredit. Keeps
+    /// `version` and each record's `updated_at`.
+    pub fn revalidated(self) -> Result<Registry, RegistryError> {
+        let mut out = Registry {
+            version: self.version,
+            issuers: BTreeMap::new(),
+        };
+        let mut pending: Vec<IssuerRecord> = self.issuers.into_values().collect();
+        while !pending.is_empty() {
+            let (ready, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| {
+                r.accredited_by
+                    .as_deref()
+                    .is_none_or(|a| out.issuers.contains_key(a))
+            });
+            if ready.is_empty() {
+                // Whatever is left points at a missing accreditor or forms
+                // a cycle; `validate` names the first problem.
+                let first = &rest[0];
+                return Err(out.validate(first).err().unwrap_or_else(|| {
+                    RegistryError::UnknownAccreditor(
+                        first.accredited_by.clone().unwrap_or_default(),
+                    )
+                }));
+            }
+            for record in ready {
+                out.validate(&record)?;
+                out.issuers.insert(record.did.clone(), record);
+            }
+            pending = rest;
+        }
+        Ok(out)
+    }
+
     fn validate(&self, record: &IssuerRecord) -> Result<(), RegistryError> {
         if !is_did(&record.did) {
             return Err(RegistryError::InvalidDid(record.did.clone()));
@@ -217,6 +270,11 @@ impl Registry {
                         .accredited_by
                         .as_deref()
                         .and_then(|d| self.issuers.get(d));
+                }
+                // Refuse chains `check` would always reject: this record's
+                // ancestors, itself, and its longest line of descendants.
+                if seen.len() + 1 + self.descendant_height(&record.did, 0) > MAX_CHAIN_DEPTH {
+                    return Err(RegistryError::ChainTooLong);
                 }
                 Ok(())
             }
@@ -314,7 +372,17 @@ mod records_as_list {
         deserializer: D,
     ) -> Result<BTreeMap<String, IssuerRecord>, D::Error> {
         let list = Vec::<IssuerRecord>::deserialize(deserializer)?;
-        Ok(list.into_iter().map(|r| (r.did.clone(), r)).collect())
+        let mut map = BTreeMap::new();
+        for record in list {
+            if map.contains_key(&record.did) {
+                return Err(serde::de::Error::custom(format!(
+                    "'{}' is listed more than once",
+                    record.did
+                )));
+            }
+            map.insert(record.did.clone(), record);
+        }
+        Ok(map)
     }
 }
 
@@ -484,6 +552,84 @@ mod tests {
             ),
             Err(RegistryError::Cycle(sub.into()))
         );
+    }
+
+    #[test]
+    fn chains_longer_than_the_check_allows_are_refused_at_write() {
+        let mut r = Registry::default();
+        r.upsert(record("did:web:t0.example", Role::RootTao, &["*"], None), 1)
+            .unwrap();
+        for i in 1..MAX_CHAIN_DEPTH {
+            r.upsert(
+                record(
+                    &format!("did:web:t{i}.example"),
+                    Role::Tao,
+                    &["A"],
+                    Some(&format!("did:web:t{}.example", i - 1)),
+                ),
+                1,
+            )
+            .unwrap();
+        }
+        let last = format!("did:web:t{}.example", MAX_CHAIN_DEPTH - 1);
+        assert!(r.check(&last, "A", 1).trusted);
+        assert_eq!(
+            r.upsert(
+                record("did:web:too-deep.example", Role::Ti, &["A"], Some(&last)),
+                1
+            ),
+            Err(RegistryError::ChainTooLong)
+        );
+        // Re-parenting a subtree deeper is caught too: t1 under a new TAO
+        // at depth 2 would push the bottom of t1's subtree past the limit.
+        r.upsert(
+            record(
+                "did:web:side.example",
+                Role::Tao,
+                &["A"],
+                Some("did:web:t0.example"),
+            ),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            r.upsert(
+                record(
+                    "did:web:t1.example",
+                    Role::Tao,
+                    &["A"],
+                    Some("did:web:side.example")
+                ),
+                1
+            ),
+            Err(RegistryError::ChainTooLong)
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_files_that_break_the_rules() {
+        let good = three_tier();
+        assert_eq!(good.clone().revalidated().unwrap(), good);
+
+        let mut wildcard = three_tier();
+        wildcard.issuers.get_mut(TI).unwrap().credential_types = vec!["*".into()];
+        assert_eq!(
+            wildcard.revalidated(),
+            Err(RegistryError::WildcardNotAllowed)
+        );
+
+        let mut orphan = three_tier();
+        orphan.issuers.remove(TAO);
+        assert_eq!(
+            orphan.revalidated(),
+            Err(RegistryError::UnknownAccreditor(TAO.into()))
+        );
+
+        let json = serde_json::json!({"version": 1, "issuers": [
+            record(ROOT, Role::RootTao, &["*"], None),
+            record(ROOT, Role::RootTao, &["*"], None),
+        ]});
+        assert!(serde_json::from_value::<Registry>(json).is_err());
     }
 
     #[test]
