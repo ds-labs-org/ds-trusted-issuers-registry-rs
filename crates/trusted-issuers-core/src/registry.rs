@@ -437,7 +437,43 @@ fn uppercase_escapes(s: &str) -> String {
 /// accepting one would store a record no credential's issuer DID can match.
 /// Empty segments between colons are legal in the grammar, a trailing colon
 /// is not.
+///
+/// `did:web` is stricter: its first segment is a DNS host, optionally
+/// followed by `%3A` and a port (see [`is_did_web_host`]).
 fn is_did(s: &str) -> bool {
+    is_did_core(s)
+        && s.strip_prefix("did:web:")
+            .is_none_or(|rest| is_did_web_host(rest.split(':').next().unwrap_or_default()))
+}
+
+/// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
+/// host made of DNS characters (`[A-Za-z0-9.-]`) and the port of digits.
+///
+/// The did:web method only percent-encodes the `:` before a port. Any other
+/// escape (`%2F`, `%40`, `%2E`, ...) decodes to a path, userinfo or a
+/// character a resolver may or may not decode, so the same party could be
+/// spelled several ways that [`canonical_did`] can't safely merge; such a
+/// DID is refused instead of stored under one spelling.
+fn is_did_web_host(segment: &str) -> bool {
+    let (host, port) = match segment.find('%') {
+        Some(i) => (&segment[..i], Some(&segment[i..])),
+        None => (segment, None),
+    };
+    let host_ok = !host.is_empty()
+        && host
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'));
+    let port_ok = port.is_none_or(|p| {
+        p.get(..3)
+            .is_some_and(|sep| sep.eq_ignore_ascii_case("%3A"))
+            && p.len() > 3
+            && p[3..].bytes().all(|c| c.is_ascii_digit())
+    });
+    host_ok && port_ok
+}
+
+/// [`is_did`]'s method-independent part: the DID Core ABNF.
+fn is_did_core(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("did:") else {
         return false;
     };
@@ -800,23 +836,6 @@ mod tests {
             canonical_did("did:web:Example.COM%2fAlice"),
             "did:web:example.com%2FAlice"
         );
-    }
-
-    #[test]
-    fn upsert_does_not_merge_case_variants_of_an_encoded_path() {
-        let mut r = three_tier();
-        let before = r.issuers.len();
-        for did in [
-            "did:web:tenant.example%2FAlice",
-            "did:web:tenant.example%2Falice",
-        ] {
-            r.upsert(
-                record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
-                2,
-            )
-            .unwrap();
-        }
-        assert_eq!(r.issuers.len(), before + 2);
     }
 
     #[test]

@@ -53,16 +53,19 @@ others can't be removed or demoted to `ti`. Failed writes change nothing.
 **DID canonicalization.** `did:web` DIDs are stored and looked up in one
 canonical form: the DNS host is lowercased and the hex digits of
 percent-escapes are uppercased (`did:web:Host.example%3a8443` is
-`did:web:host.example%3A8443`; path segments, and text after an encoded
-delimiter such as `%2F` in the host segment, keep their case). It applies to `did` and `accreditedBy` on
-write and to the DID in every read, check and status change, so a record
+`did:web:host.example%3A8443`; path segments keep their case). It applies
+to `did` and `accreditedBy` on write and to the DID in every read, check
+and status change, so a record
 matches however a credential spells its issuer. Other DID methods are
 compared as given. Two records that collapse to the same DID in a loaded
 data file or snapshot are refused as duplicates.
 
 A record's `did` must be a bare DID per DID Core syntax. DID URLs
 (with a `#fragment`, `?query` or `/path`), spaces, a trailing `:` and
-malformed `%` escapes are refused with 422.
+malformed `%` escapes are refused with 422. A `did:web` host must be a DNS
+name (`[A-Za-z0-9.-]`) with an optional `%3A` and port; any other escape in
+it (`did:web:example.com%2FAlice`) is refused, since it could name the same
+party under several spellings.
 
 **Upgrading.** On startup, data files and snapshots are re-checked under
 this DID syntax and canonical form. A record whose DID is now invalid (for
