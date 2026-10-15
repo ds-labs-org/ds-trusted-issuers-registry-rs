@@ -339,6 +339,13 @@ impl Registry {
     }
 }
 
+/// The canonical spelling of `did`, used as the registry key.
+///
+/// Stub: returns the input unchanged until canonicalization lands.
+pub fn canonical_did(did: &str) -> String {
+    did.to_string()
+}
+
 /// `did:<method>:<method-specific-id>`, both parts non-empty.
 fn is_did(s: &str) -> bool {
     let mut parts = s.splitn(3, ':');
@@ -630,6 +637,122 @@ mod tests {
             record(ROOT, Role::RootTao, &["*"], None),
         ]});
         assert!(serde_json::from_value::<Registry>(json).is_err());
+    }
+
+    #[test]
+    fn canonical_did_normalizes_did_web_only() {
+        for (input, want) in [
+            ("did:web:issuer.example", "did:web:issuer.example"),
+            ("did:web:Issuer.EXAMPLE", "did:web:issuer.example"),
+            ("did:web:host.example%3a8443", "did:web:host.example%3A8443"),
+            ("did:web:HOST.example%3a8443", "did:web:host.example%3A8443"),
+            // Path segments are case-sensitive; only their escapes change.
+            (
+                "did:web:Example.com:Users:Alice%2fx",
+                "did:web:example.com:Users:Alice%2Fx",
+            ),
+            // Other methods are returned unchanged.
+            ("did:key:z6MkAbC%3a", "did:key:z6MkAbC%3a"),
+            ("did:ebsi:zAbC", "did:ebsi:zAbC"),
+            ("not-a-did", "not-a-did"),
+        ] {
+            assert_eq!(canonical_did(input), want, "{input}");
+            assert_eq!(canonical_did(want), want, "idempotent: {want}");
+        }
+    }
+
+    #[test]
+    fn lookups_accept_non_canonical_dids() {
+        let mut r = Registry::default();
+        r.upsert(record(ROOT, Role::RootTao, &["*"], None), 1)
+            .unwrap();
+        r.upsert(
+            record("did:web:host.example%3A8443", Role::Tao, &["A"], Some(ROOT)),
+            1,
+        )
+        .unwrap();
+        let mixed = "did:web:HOST.example%3a8443";
+        assert!(r.get(mixed).is_some());
+        let d = r.check(mixed, "A", 10);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec!["did:web:host.example%3A8443", ROOT]);
+        assert_eq!(r.dependents_of("did:web:AUTHORITY.example").len(), 1);
+        r.set_status(mixed, Status::Suspended, 5).unwrap();
+        assert!(!r.check(mixed, "A", 10).trusted);
+        assert!(matches!(
+            r.remove("did:web:AUTHORITY.example"),
+            Err(RegistryError::HasDependents { .. })
+        ));
+        r.remove(mixed).unwrap();
+        assert!(r.get("did:web:host.example%3A8443").is_none());
+    }
+
+    #[test]
+    fn upsert_stores_the_canonical_form() {
+        let mut r = three_tier();
+        r.upsert(
+            record(
+                "did:web:New.Example%3a8443",
+                Role::Ti,
+                &["MembershipCredential"],
+                Some("did:web:TAO.example"),
+            ),
+            2,
+        )
+        .unwrap();
+        let stored = r.get("did:web:new.example%3A8443").unwrap();
+        assert_eq!(stored.did, "did:web:new.example%3A8443");
+        assert_eq!(stored.accredited_by.as_deref(), Some(TAO));
+        // Writing the same DID in another spelling replaces, not duplicates.
+        let before = r.issuers.len();
+        r.upsert(
+            record(
+                "did:web:NEW.example%3A8443",
+                Role::Ti,
+                &["MembershipCredential"],
+                Some(TAO),
+            ),
+            3,
+        )
+        .unwrap();
+        assert_eq!(r.issuers.len(), before);
+        assert!(r.issuers.keys().all(|k| k == &canonical_did(k)));
+    }
+
+    #[test]
+    fn non_canonical_accredited_by_still_resolves() {
+        let mut r = three_tier();
+        r.upsert(
+            record(
+                "did:web:other.example",
+                Role::Ti,
+                &["MembershipCredential"],
+                Some("did:web:Tao.Example"),
+            ),
+            2,
+        )
+        .unwrap();
+        let d = r.check("did:web:other.example", "MembershipCredential", 10);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec!["did:web:other.example", TAO, ROOT]);
+    }
+
+    #[test]
+    fn revalidation_canonicalizes_and_rejects_collisions() {
+        let mut loose = three_tier();
+        let mut ti = loose.issuers.remove(TI).unwrap();
+        ti.did = "did:web:Issuer.example".into();
+        ti.accredited_by = Some("did:web:TAO.example".into());
+        loose.issuers.insert(ti.did.clone(), ti);
+        let fixed = loose.revalidated().unwrap();
+        assert!(fixed.issuers.contains_key(TI));
+        assert_eq!(fixed.get(TI).unwrap().accredited_by.as_deref(), Some(TAO));
+
+        let mut dup = three_tier();
+        let mut twin = dup.get(TI).unwrap().clone();
+        twin.did = "did:web:ISSUER.example".into();
+        dup.issuers.insert(twin.did.clone(), twin);
+        assert_eq!(dup.revalidated(), Err(RegistryError::Duplicate(TI.into())));
     }
 
     #[test]

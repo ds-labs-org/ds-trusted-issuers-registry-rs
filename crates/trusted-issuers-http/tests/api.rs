@@ -488,3 +488,67 @@ async fn admin_probe_reports_whether_writes_are_allowed() {
     let (status, _, _) = call(&disabled, "GET", "/v1/admin", Some(TOKEN), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn dids_are_canonicalized_on_write_and_lookup() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+
+    // The same DID as TI, spelled with an upper-case host and a lower-case
+    // escape, replaces it instead of creating a second record.
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        "/v1/issuers/did:web:Issuer.example%253a8443",
+        Some(TOKEN),
+        Some(json!({
+            "did": TI,
+            "role": "ti", "credentialTypes": ["MembershipCredential"],
+            "accreditedBy": "did:web:TAO.example", "status": "active"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["did"], TI);
+    assert_eq!(body["accreditedBy"], TAO);
+
+    let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(body["total"], 3);
+
+    let (status, body, _) = call(
+        &s,
+        "GET",
+        "/v1/issuers/did:web:ISSUER.example%253a8443",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["did"], TI);
+
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        "/v1/issuers/did:web:ISSUER.example%253a8443/types/MembershipCredential",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(body["trusted"], true, "{body}");
+    assert_eq!(body["chain"], json!([TI, TAO, ROOT]));
+
+    // A body did that is the same DID in another spelling is not a mismatch.
+    let (status, _, _) = call(
+        &s,
+        "PUT",
+        "/v1/issuers/did:web:tao.example",
+        Some(TOKEN),
+        Some(json!({
+            "did": "did:web:TAO.example",
+            "role": "tao", "credentialTypes": ["MembershipCredential"],
+            "accreditedBy": ROOT, "status": "active"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
