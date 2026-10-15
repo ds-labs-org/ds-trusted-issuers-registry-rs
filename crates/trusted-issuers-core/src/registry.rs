@@ -922,7 +922,7 @@ mod tests {
             "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
             "did:ebsi:zabc",
             "did:x::a",
-            "did:web:a_b-c.d",
+            "did:x:a_b-c.d",
         ] {
             assert!(is_did(valid), "{valid} should be valid");
         }
@@ -944,6 +944,55 @@ mod tests {
         ] {
             assert!(!is_did(invalid), "{invalid} should be invalid");
         }
+    }
+
+    #[test]
+    fn did_web_host_is_a_dns_name_with_an_optional_port() {
+        for valid in [
+            "did:web:Issuer.Example",
+            "did:web:localhost%3A8443",
+            "did:web:localhost%3a8443",
+            "did:web:example.com:user%2Dx:Alice",
+        ] {
+            assert!(is_did(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            // Escapes other than the port separator decode to something
+            // that is not part of a DNS host.
+            "did:web:example.com%2FAlice",
+            "did:web:user%40example.com",
+            "did:web:%49ssuer.example",
+            "did:web:issuer%2Eexample",
+            // The port separator needs a port, and only one.
+            "did:web:localhost%3A",
+            "did:web:localhost%3Ahttp",
+            "did:web:localhost%3A80%3A81",
+            "did:web:%3A8443",
+            // Not DNS host characters.
+            "did:web:a_b.example",
+        ] {
+            assert!(!is_did(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn upsert_refuses_an_encoded_delimiter_in_the_did_web_host() {
+        let mut r = three_tier();
+        assert_eq!(
+            r.upsert(
+                record(
+                    "did:web:tenant.example%2FAlice",
+                    Role::Ti,
+                    &["MembershipCredential"],
+                    Some(TAO)
+                ),
+                2
+            ),
+            Err(RegistryError::InvalidDid(
+                "did:web:tenant.example%2FAlice".into()
+            ))
+        );
+        assert_eq!(r.version, 3);
     }
 
     #[test]
