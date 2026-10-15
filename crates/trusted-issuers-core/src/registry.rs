@@ -447,7 +447,8 @@ fn is_did(s: &str) -> bool {
 }
 
 /// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
-/// host made of DNS characters (`[A-Za-z0-9.-]`) and the port of digits.
+/// host made of DNS characters (`[A-Za-z0-9.-]`) and the port a decimal
+/// 1-65535 (the same rule `--did-host` applies to the registry's own DID).
 ///
 /// The did:web method only percent-encodes the `:` before a port. Any other
 /// escape (`%2F`, `%40`, `%2E`, ...) decodes to a path, userinfo or a
@@ -466,8 +467,8 @@ fn is_did_web_host(segment: &str) -> bool {
     let port_ok = port.is_none_or(|p| {
         p.get(..3)
             .is_some_and(|sep| sep.eq_ignore_ascii_case("%3A"))
-            && p.len() > 3
             && p[3..].bytes().all(|c| c.is_ascii_digit())
+            && p[3..].parse::<u16>().is_ok_and(|port| port > 0)
     });
     host_ok && port_ok
 }

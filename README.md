@@ -63,9 +63,9 @@ data file or snapshot are refused as duplicates.
 A record's `did` must be a bare DID per DID Core syntax. DID URLs
 (with a `#fragment`, `?query` or `/path`), spaces, a trailing `:` and
 malformed `%` escapes are refused with 422. A `did:web` host must be a DNS
-name (`[A-Za-z0-9.-]`) with an optional `%3A` and port; any other escape in
-it (`did:web:example.com%2FAlice`) is refused, since it could name the same
-party under several spellings.
+name (`[A-Za-z0-9.-]`) with an optional `%3A` and port (1-65535); any
+other escape in it (`did:web:example.com%2FAlice`) is refused, since it
+could name the same party under several spellings.
 
 **Upgrading.** On startup, data files and snapshots are re-checked under
 this DID syntax and canonical form. A record whose DID is now invalid (for
