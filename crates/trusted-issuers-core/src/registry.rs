@@ -971,6 +971,8 @@ mod tests {
             "did:web:Issuer.Example",
             "did:web:localhost%3A8443",
             "did:web:localhost%3a8443",
+            "did:web:localhost%3A1",
+            "did:web:localhost%3A65535",
             "did:web:example.com:user%2Dx:Alice",
         ] {
             assert!(is_did(valid), "{valid} should be valid");
@@ -987,6 +989,12 @@ mod tests {
             "did:web:localhost%3Ahttp",
             "did:web:localhost%3A80%3A81",
             "did:web:%3A8443",
+            // A port is 1-65535, as `--did-host` requires for the
+            // registry's own DID.
+            "did:web:localhost%3A0",
+            "did:web:localhost%3A65536",
+            "did:web:localhost%3A99999",
+            "did:web:localhost%3A123456789012345678901234567890",
             // Not DNS host characters.
             "did:web:a_b.example",
         ] {
