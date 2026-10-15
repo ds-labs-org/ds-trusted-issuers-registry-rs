@@ -91,7 +91,7 @@ pub struct Registry {
 
 impl Registry {
     pub fn get(&self, did: &str) -> Option<&IssuerRecord> {
-        self.issuers.get(did)
+        self.issuers.get(&canonical_did(did))
     }
 
     pub fn list(&self) -> impl Iterator<Item = &IssuerRecord> {
@@ -100,16 +100,21 @@ impl Registry {
 
     /// DIDs of the records whose `accredited_by` is `did`.
     pub fn dependents_of(&self, did: &str) -> Vec<String> {
+        let did = canonical_did(did);
         self.issuers
             .values()
-            .filter(|r| r.accredited_by.as_deref() == Some(did))
+            .filter(|r| r.accredited_by.as_deref() == Some(did.as_str()))
             .map(|r| r.did.clone())
             .collect()
     }
 
     /// Inserts or replaces a record after validating it against the
-    /// registry's current contents. `now` becomes its `updated_at`.
+    /// registry's current contents. `now` becomes its `updated_at`. The
+    /// record's `did` and `accredited_by` are stored in [`canonical_did`]
+    /// form, so a rewrite in another spelling replaces instead of
+    /// duplicating.
     pub fn upsert(&mut self, mut record: IssuerRecord, now: u64) -> Result<(), RegistryError> {
+        canonicalize(&mut record);
         self.validate(&record)?;
         record.updated_at = now;
         self.issuers.insert(record.did.clone(), record);
@@ -121,10 +126,11 @@ impl Registry {
     /// immediately distrusts everything it accredited, via
     /// [`Registry::check`].
     pub fn set_status(&mut self, did: &str, status: Status, now: u64) -> Result<(), RegistryError> {
+        let did = canonical_did(did);
         let record = self
             .issuers
-            .get_mut(did)
-            .ok_or_else(|| RegistryError::NotFound(did.to_string()))?;
+            .get_mut(&did)
+            .ok_or(RegistryError::NotFound(did))?;
         record.status = status;
         record.updated_at = now;
         self.version += 1;
@@ -134,17 +140,15 @@ impl Registry {
     /// Removes a record. Refused while other records name it as their
     /// accreditor, so a removal never leaves a dangling `accreditedBy`.
     pub fn remove(&mut self, did: &str) -> Result<IssuerRecord, RegistryError> {
-        let dependents = self.dependents_of(did);
+        let did = canonical_did(did);
+        let dependents = self.dependents_of(&did);
         if !dependents.is_empty() {
-            return Err(RegistryError::HasDependents {
-                did: did.to_string(),
-                dependents,
-            });
+            return Err(RegistryError::HasDependents { did, dependents });
         }
         let removed = self
             .issuers
-            .remove(did)
-            .ok_or_else(|| RegistryError::NotFound(did.to_string()))?;
+            .remove(&did)
+            .ok_or(RegistryError::NotFound(did))?;
         self.version += 1;
         Ok(removed)
     }
@@ -166,13 +170,24 @@ impl Registry {
     /// Re-applies every write rule to a registry that did not come through
     /// [`Registry::upsert`] (a data file loaded from disk, a snapshot),
     /// inserting accreditors before the records they accredit. Keeps
-    /// `version` and each record's `updated_at`.
+    /// `version` and each record's `updated_at`. Records are brought to
+    /// [`canonical_did`] form first, and two that collapse to the same DID
+    /// are refused as [`RegistryError::Duplicate`] rather than one silently
+    /// shadowing the other.
     pub fn revalidated(self) -> Result<Registry, RegistryError> {
         let mut out = Registry {
             version: self.version,
             issuers: BTreeMap::new(),
         };
-        let mut pending: Vec<IssuerRecord> = self.issuers.into_values().collect();
+        let mut pending: Vec<IssuerRecord> = Vec::with_capacity(self.issuers.len());
+        let mut seen = BTreeSet::new();
+        for mut record in self.issuers.into_values() {
+            canonicalize(&mut record);
+            if !seen.insert(record.did.clone()) {
+                return Err(RegistryError::Duplicate(record.did));
+            }
+            pending.push(record);
+        }
         while !pending.is_empty() {
             let (ready, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| {
                 r.accredited_by
@@ -287,7 +302,7 @@ impl Registry {
     /// for the type.
     pub fn check(&self, did: &str, credential_type: &str, now: u64) -> TrustDecision {
         let mut chain = Vec::new();
-        let mut cursor = did.to_string();
+        let mut cursor = canonical_did(did);
         loop {
             chain.push(cursor.clone());
             if chain.len() > MAX_CHAIN_DEPTH {
@@ -339,11 +354,65 @@ impl Registry {
     }
 }
 
-/// The canonical spelling of `did`, used as the registry key.
+/// The canonical spelling of `did`, which is what the registry stores and
+/// looks up by.
 ///
-/// Stub: returns the input unchanged until canonicalization lands.
+/// Matching is by exact string, but `did:web` resolution is not: DNS hosts
+/// are case-insensitive and percent-escapes (`%3a` vs `%3A`, the port
+/// separator) are the same byte either way. Without one spelling, a record
+/// written as `did:web:Issuer.example` would never match a credential whose
+/// issuer says `did:web:issuer.example`, silently distrusting a listed
+/// issuer. So for `did:web` the host (first segment) is lowercased and every
+/// percent-escape's hex digits are uppercased. Path segments keep their case
+/// because servers treat paths as case-sensitive. Other methods define their
+/// own equivalence, so they are returned unchanged.
 pub fn canonical_did(did: &str) -> String {
-    did.to_string()
+    let Some(rest) = did.strip_prefix("did:web:") else {
+        return did.to_string();
+    };
+    let segments: Vec<String> = rest
+        .split(':')
+        .enumerate()
+        .map(|(i, segment)| {
+            if i == 0 {
+                uppercase_escapes(&segment.to_ascii_lowercase())
+            } else {
+                uppercase_escapes(segment)
+            }
+        })
+        .collect();
+    format!("did:web:{}", segments.join(":"))
+}
+
+/// Puts a record's DID references in [`canonical_did`] form.
+fn canonicalize(record: &mut IssuerRecord) {
+    record.did = canonical_did(&record.did);
+    record.accredited_by = record.accredited_by.as_deref().map(canonical_did);
+}
+
+/// Uppercases the two hex digits of every `%xx` escape in `s`.
+fn uppercase_escapes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('%');
+            out.push(bytes[i + 1].to_ascii_uppercase() as char);
+            out.push(bytes[i + 2].to_ascii_uppercase() as char);
+            i += 3;
+        } else {
+            // Not an escape: copy the whole char (`i` is on a boundary).
+            let c = s[i..].chars().next().expect("i < len");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
 }
 
 /// `did:<method>:<method-specific-id>`, both parts non-empty.

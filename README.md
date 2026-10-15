@@ -50,6 +50,15 @@ the child's types, and not close a cycle or make a chain longer than 8
 links. A record that still accredits
 others can't be removed or demoted to `ti`. Failed writes change nothing.
 
+**DID canonicalization.** `did:web` DIDs are stored and looked up in one
+canonical form: the host is lowercased and the hex digits of percent-escapes
+are uppercased (`did:web:Host.example%3a8443` is `did:web:host.example%3A8443`;
+path segments keep their case). It applies to `did` and `accreditedBy` on
+write and to the DID in every read, check and status change, so a record
+matches however a credential spells its issuer. Other DID methods are
+compared as given. Two records that collapse to the same DID in a loaded
+data file or snapshot are refused as duplicates.
+
 ## API
 
 Public reads, no authentication:

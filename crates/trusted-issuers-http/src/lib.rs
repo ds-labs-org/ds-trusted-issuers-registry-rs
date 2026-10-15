@@ -43,7 +43,9 @@ use dcp_core::{DcpKeyPair, now_secs};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
-use trusted_issuers_core::{IssuerRecord, Registry, RegistryError, Role, Status, sign_snapshot};
+use trusted_issuers_core::{
+    IssuerRecord, Registry, RegistryError, Role, Status, canonical_did, sign_snapshot,
+};
 
 pub const SNAPSHOT_CONTENT_TYPE: &str = "application/trust-list+jwt";
 
@@ -349,11 +351,14 @@ async fn put_issuer(
     Path(did): Path<String>,
     body: Result<Json<PutBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // Compare and store the canonical form, so the path and body may spell
+    // the same DID differently.
+    let did = canonical_did(&did);
     let body = match body {
         Ok(Json(b)) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
-    if body.did.as_deref().is_some_and(|d| d != did) {
+    if body.did.as_deref().is_some_and(|d| canonical_did(d) != did) {
         return error(StatusCode::BAD_REQUEST, "body did does not match the path").into_response();
     }
     let record = IssuerRecord {
