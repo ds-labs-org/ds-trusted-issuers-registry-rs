@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/trusted-issuers-core",
+    "crates/trusted-issuers-http",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ds-labs-org/ds-trusted-issuers-registry-rs"
+
+[workspace.dependencies]
+# Same pin as ds-identity-hub-rs, so the registry and its main consumer sign
+# and verify JWS with the exact same code.
+ds-dcp-core-rs = { git = "https://github.com/ds-labs-org/ds-dcp-core-rs", rev = "78ef8d0e25f496a6674fd916939c690af4735023" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+clap = { version = "4", features = ["derive", "env"] }

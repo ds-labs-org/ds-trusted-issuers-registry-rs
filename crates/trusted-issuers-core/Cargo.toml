@@ -1,0 +1,15 @@
+[package]
+name = "trusted-issuers-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Trusted issuers registry domain: issuer/accreditation records, the accreditation-chain trust check, and the signed trust-list snapshot (sign and verify). Network-free, so verifiers such as ds-identity-hub-rs can embed it."
+
+[dependencies]
+ds-dcp-core-rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+p256 = { workspace = true }
