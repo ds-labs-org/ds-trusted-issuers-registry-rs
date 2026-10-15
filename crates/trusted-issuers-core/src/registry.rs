@@ -415,16 +415,52 @@ fn uppercase_escapes(s: &str) -> String {
     out
 }
 
-/// `did:<method>:<method-specific-id>`, both parts non-empty.
+/// Whether `s` is a DID per DID Core's syntax, not a DID URL:
+/// `did:` method `:` method-specific-id, where the method is one or more of
+/// `[a-z0-9]` and the id is `*( *idchar ":" ) 1*idchar` with
+/// `idchar = ALPHA / DIGIT / "." / "-" / "_" / pct-encoded`.
+///
+/// A fragment, query or path (`#key-1`, `?versionId=1`, `/x`) makes it a DID
+/// URL, which names a resource of a DID and not a party that can be listed;
+/// accepting one would store a record no credential's issuer DID can match.
+/// Empty segments between colons are legal in the grammar, a trailing colon
+/// is not.
 fn is_did(s: &str) -> bool {
-    let mut parts = s.splitn(3, ':');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some("did"), Some(method), Some(id))
-            if !method.is_empty()
-                && method.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                && !id.is_empty()
-    )
+    let Some(rest) = s.strip_prefix("did:") else {
+        return false;
+    };
+    let Some((method, id)) = rest.split_once(':') else {
+        return false;
+    };
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return false;
+    }
+    // The grammar's last segment is non-empty: the id ends in an idchar.
+    if id.is_empty() || id.ends_with(':') {
+        return false;
+    }
+    let bytes = id.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if !(i + 2 < bytes.len()
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit())
+                {
+                    return false;
+                }
+                i += 3;
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b':') => i += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Serializes the DID-keyed map as a plain array of records (the DID is

@@ -59,6 +59,10 @@ matches however a credential spells its issuer. Other DID methods are
 compared as given. Two records that collapse to the same DID in a loaded
 data file or snapshot are refused as duplicates.
 
+A record's `did` must be a bare DID per DID Core syntax. DID URLs
+(with a `#fragment`, `?query` or `/path`), spaces, a trailing `:` and
+malformed `%` escapes are refused with 422.
+
 ## API
 
 Public reads, no authentication:
