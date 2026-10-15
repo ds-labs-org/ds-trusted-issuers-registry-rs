@@ -91,7 +91,7 @@ pub struct Registry {
 
 impl Registry {
     pub fn get(&self, did: &str) -> Option<&IssuerRecord> {
-        self.issuers.get(did)
+        self.issuers.get(&canonical_did(did))
     }
 
     pub fn list(&self) -> impl Iterator<Item = &IssuerRecord> {
@@ -100,16 +100,21 @@ impl Registry {
 
     /// DIDs of the records whose `accredited_by` is `did`.
     pub fn dependents_of(&self, did: &str) -> Vec<String> {
+        let did = canonical_did(did);
         self.issuers
             .values()
-            .filter(|r| r.accredited_by.as_deref() == Some(did))
+            .filter(|r| r.accredited_by.as_deref() == Some(did.as_str()))
             .map(|r| r.did.clone())
             .collect()
     }
 
     /// Inserts or replaces a record after validating it against the
-    /// registry's current contents. `now` becomes its `updated_at`.
+    /// registry's current contents. `now` becomes its `updated_at`. The
+    /// record's `did` and `accredited_by` are stored in [`canonical_did`]
+    /// form, so a rewrite in another spelling replaces instead of
+    /// duplicating.
     pub fn upsert(&mut self, mut record: IssuerRecord, now: u64) -> Result<(), RegistryError> {
+        canonicalize(&mut record);
         self.validate(&record)?;
         record.updated_at = now;
         self.issuers.insert(record.did.clone(), record);
@@ -121,10 +126,11 @@ impl Registry {
     /// immediately distrusts everything it accredited, via
     /// [`Registry::check`].
     pub fn set_status(&mut self, did: &str, status: Status, now: u64) -> Result<(), RegistryError> {
+        let did = canonical_did(did);
         let record = self
             .issuers
-            .get_mut(did)
-            .ok_or_else(|| RegistryError::NotFound(did.to_string()))?;
+            .get_mut(&did)
+            .ok_or(RegistryError::NotFound(did))?;
         record.status = status;
         record.updated_at = now;
         self.version += 1;
@@ -134,17 +140,15 @@ impl Registry {
     /// Removes a record. Refused while other records name it as their
     /// accreditor, so a removal never leaves a dangling `accreditedBy`.
     pub fn remove(&mut self, did: &str) -> Result<IssuerRecord, RegistryError> {
-        let dependents = self.dependents_of(did);
+        let did = canonical_did(did);
+        let dependents = self.dependents_of(&did);
         if !dependents.is_empty() {
-            return Err(RegistryError::HasDependents {
-                did: did.to_string(),
-                dependents,
-            });
+            return Err(RegistryError::HasDependents { did, dependents });
         }
         let removed = self
             .issuers
-            .remove(did)
-            .ok_or_else(|| RegistryError::NotFound(did.to_string()))?;
+            .remove(&did)
+            .ok_or(RegistryError::NotFound(did))?;
         self.version += 1;
         Ok(removed)
     }
@@ -166,13 +170,24 @@ impl Registry {
     /// Re-applies every write rule to a registry that did not come through
     /// [`Registry::upsert`] (a data file loaded from disk, a snapshot),
     /// inserting accreditors before the records they accredit. Keeps
-    /// `version` and each record's `updated_at`.
+    /// `version` and each record's `updated_at`. Records are brought to
+    /// [`canonical_did`] form first, and two that collapse to the same DID
+    /// are refused as [`RegistryError::Duplicate`] rather than one silently
+    /// shadowing the other.
     pub fn revalidated(self) -> Result<Registry, RegistryError> {
         let mut out = Registry {
             version: self.version,
             issuers: BTreeMap::new(),
         };
-        let mut pending: Vec<IssuerRecord> = self.issuers.into_values().collect();
+        let mut pending: Vec<IssuerRecord> = Vec::with_capacity(self.issuers.len());
+        let mut seen = BTreeSet::new();
+        for mut record in self.issuers.into_values() {
+            canonicalize(&mut record);
+            if !seen.insert(record.did.clone()) {
+                return Err(RegistryError::Duplicate(record.did));
+            }
+            pending.push(record);
+        }
         while !pending.is_empty() {
             let (ready, rest): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| {
                 r.accredited_by
@@ -287,7 +302,7 @@ impl Registry {
     /// for the type.
     pub fn check(&self, did: &str, credential_type: &str, now: u64) -> TrustDecision {
         let mut chain = Vec::new();
-        let mut cursor = did.to_string();
+        let mut cursor = canonical_did(did);
         loop {
             chain.push(cursor.clone());
             if chain.len() > MAX_CHAIN_DEPTH {
@@ -339,16 +354,125 @@ impl Registry {
     }
 }
 
-/// `did:<method>:<method-specific-id>`, both parts non-empty.
+/// The canonical spelling of `did`, which is what the registry stores and
+/// looks up by.
+///
+/// Matching is by exact string, but `did:web` resolution is not: DNS hosts
+/// are case-insensitive and percent-escapes (`%3a` vs `%3A`, the port
+/// separator) are the same byte either way. Without one spelling, a record
+/// written as `did:web:Issuer.example` would never match a credential whose
+/// issuer says `did:web:issuer.example`, silently distrusting a listed
+/// issuer. So for `did:web` the DNS host (the first segment up to its first
+/// `%` escape) is lowercased and every percent-escape's hex digits are
+/// uppercased. Everything else keeps its case: path segments, and anything
+/// after an escape in the first segment, because a resolver that decodes
+/// `%2F`, `%40`, `%3F` or `%23` turns that text into a path, userinfo or
+/// query, which servers treat as case-sensitive. Folding it would merge
+/// records of different parties. Other methods define their
+/// own equivalence, so they are returned unchanged.
+pub fn canonical_did(did: &str) -> String {
+    let Some(rest) = did.strip_prefix("did:web:") else {
+        return did.to_string();
+    };
+    let segments: Vec<String> = rest
+        .split(':')
+        .enumerate()
+        .map(|(i, segment)| {
+            if i == 0 {
+                let (host, tail) = segment.split_at(segment.find('%').unwrap_or(segment.len()));
+                if host
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+                {
+                    uppercase_escapes(&(host.to_ascii_lowercase() + tail))
+                } else {
+                    uppercase_escapes(segment)
+                }
+            } else {
+                uppercase_escapes(segment)
+            }
+        })
+        .collect();
+    format!("did:web:{}", segments.join(":"))
+}
+
+/// Puts a record's DID references in [`canonical_did`] form.
+fn canonicalize(record: &mut IssuerRecord) {
+    record.did = canonical_did(&record.did);
+    record.accredited_by = record.accredited_by.as_deref().map(canonical_did);
+}
+
+/// Uppercases the two hex digits of every `%xx` escape in `s`.
+fn uppercase_escapes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('%');
+            out.push(bytes[i + 1].to_ascii_uppercase() as char);
+            out.push(bytes[i + 2].to_ascii_uppercase() as char);
+            i += 3;
+        } else {
+            // Not an escape: copy the whole char (`i` is on a boundary).
+            let c = s[i..].chars().next().expect("i < len");
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// Whether `s` is a DID per DID Core's syntax, not a DID URL:
+/// `did:` method `:` method-specific-id, where the method is one or more of
+/// `[a-z0-9]` and the id is `*( *idchar ":" ) 1*idchar` with
+/// `idchar = ALPHA / DIGIT / "." / "-" / "_" / pct-encoded`.
+///
+/// A fragment, query or path (`#key-1`, `?versionId=1`, `/x`) makes it a DID
+/// URL, which names a resource of a DID and not a party that can be listed;
+/// accepting one would store a record no credential's issuer DID can match.
+/// Empty segments between colons are legal in the grammar, a trailing colon
+/// is not.
 fn is_did(s: &str) -> bool {
-    let mut parts = s.splitn(3, ':');
-    matches!(
-        (parts.next(), parts.next(), parts.next()),
-        (Some("did"), Some(method), Some(id))
-            if !method.is_empty()
-                && method.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                && !id.is_empty()
-    )
+    let Some(rest) = s.strip_prefix("did:") else {
+        return false;
+    };
+    let Some((method, id)) = rest.split_once(':') else {
+        return false;
+    };
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return false;
+    }
+    // The grammar's last segment is non-empty: the id ends in an idchar.
+    if id.is_empty() || id.ends_with(':') {
+        return false;
+    }
+    let bytes = id.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if !(i + 2 < bytes.len()
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit())
+                {
+                    return false;
+                }
+                i += 3;
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b':') => i += 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Serializes the DID-keyed map as a plain array of records (the DID is
@@ -630,6 +754,210 @@ mod tests {
             record(ROOT, Role::RootTao, &["*"], None),
         ]});
         assert!(serde_json::from_value::<Registry>(json).is_err());
+    }
+
+    #[test]
+    fn canonical_did_normalizes_did_web_only() {
+        for (input, want) in [
+            ("did:web:issuer.example", "did:web:issuer.example"),
+            ("did:web:Issuer.EXAMPLE", "did:web:issuer.example"),
+            ("did:web:host.example%3a8443", "did:web:host.example%3A8443"),
+            ("did:web:HOST.example%3a8443", "did:web:host.example%3A8443"),
+            // Path segments are case-sensitive; only their escapes change.
+            (
+                "did:web:Example.com:Users:Alice%2fx",
+                "did:web:example.com:Users:Alice%2Fx",
+            ),
+            // Other methods are returned unchanged.
+            ("did:key:z6MkAbC%3a", "did:key:z6MkAbC%3a"),
+            ("did:ebsi:zAbC", "did:ebsi:zAbC"),
+            ("not-a-did", "not-a-did"),
+        ] {
+            assert_eq!(canonical_did(input), want, "{input}");
+            assert_eq!(canonical_did(want), want, "idempotent: {want}");
+        }
+    }
+
+    #[test]
+    fn canonical_did_keeps_case_after_an_encoded_delimiter() {
+        // `%2F`, `%40`, `%3F`, `%23` in the host segment decode to a path,
+        // userinfo or query, which are case-sensitive, so two spellings that
+        // differ only there can name different parties and must stay apart.
+        for (a, b) in [
+            ("did:web:example.com%2FAlice", "did:web:example.com%2Falice"),
+            ("did:web:example.com%40Bob", "did:web:example.com%40bob"),
+            (
+                "did:web:example.com%3FUser%3DBob",
+                "did:web:example.com%3Fuser%3Dbob",
+            ),
+            ("did:web:example.com%23Frag", "did:web:example.com%23frag"),
+        ] {
+            assert_ne!(canonical_did(a), canonical_did(b), "{a} vs {b}");
+            assert_eq!(canonical_did(a), a, "{a} is already canonical");
+        }
+        // The DNS host in front of the escape is still folded.
+        assert_eq!(
+            canonical_did("did:web:Example.COM%2fAlice"),
+            "did:web:example.com%2FAlice"
+        );
+    }
+
+    #[test]
+    fn upsert_does_not_merge_case_variants_of_an_encoded_path() {
+        let mut r = three_tier();
+        let before = r.issuers.len();
+        for did in [
+            "did:web:tenant.example%2FAlice",
+            "did:web:tenant.example%2Falice",
+        ] {
+            r.upsert(
+                record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                2,
+            )
+            .unwrap();
+        }
+        assert_eq!(r.issuers.len(), before + 2);
+    }
+
+    #[test]
+    fn lookups_accept_non_canonical_dids() {
+        let mut r = Registry::default();
+        r.upsert(record(ROOT, Role::RootTao, &["*"], None), 1)
+            .unwrap();
+        r.upsert(
+            record("did:web:host.example%3A8443", Role::Tao, &["A"], Some(ROOT)),
+            1,
+        )
+        .unwrap();
+        let mixed = "did:web:HOST.example%3a8443";
+        assert!(r.get(mixed).is_some());
+        let d = r.check(mixed, "A", 10);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec!["did:web:host.example%3A8443", ROOT]);
+        assert_eq!(r.dependents_of("did:web:AUTHORITY.example").len(), 1);
+        r.set_status(mixed, Status::Suspended, 5).unwrap();
+        assert!(!r.check(mixed, "A", 10).trusted);
+        assert!(matches!(
+            r.remove("did:web:AUTHORITY.example"),
+            Err(RegistryError::HasDependents { .. })
+        ));
+        r.remove(mixed).unwrap();
+        assert!(r.get("did:web:host.example%3A8443").is_none());
+    }
+
+    #[test]
+    fn upsert_stores_the_canonical_form() {
+        let mut r = three_tier();
+        r.upsert(
+            record(
+                "did:web:New.Example%3a8443",
+                Role::Ti,
+                &["MembershipCredential"],
+                Some("did:web:TAO.example"),
+            ),
+            2,
+        )
+        .unwrap();
+        let stored = r.get("did:web:new.example%3A8443").unwrap();
+        assert_eq!(stored.did, "did:web:new.example%3A8443");
+        assert_eq!(stored.accredited_by.as_deref(), Some(TAO));
+        // Writing the same DID in another spelling replaces, not duplicates.
+        let before = r.issuers.len();
+        r.upsert(
+            record(
+                "did:web:NEW.example%3A8443",
+                Role::Ti,
+                &["MembershipCredential"],
+                Some(TAO),
+            ),
+            3,
+        )
+        .unwrap();
+        assert_eq!(r.issuers.len(), before);
+        assert!(r.issuers.keys().all(|k| k == &canonical_did(k)));
+    }
+
+    #[test]
+    fn non_canonical_accredited_by_still_resolves() {
+        let mut r = three_tier();
+        r.upsert(
+            record(
+                "did:web:other.example",
+                Role::Ti,
+                &["MembershipCredential"],
+                Some("did:web:Tao.Example"),
+            ),
+            2,
+        )
+        .unwrap();
+        let d = r.check("did:web:other.example", "MembershipCredential", 10);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec!["did:web:other.example", TAO, ROOT]);
+    }
+
+    #[test]
+    fn revalidation_canonicalizes_and_rejects_collisions() {
+        let mut loose = three_tier();
+        let mut ti = loose.issuers.remove(TI).unwrap();
+        ti.did = "did:web:Issuer.example".into();
+        ti.accredited_by = Some("did:web:TAO.example".into());
+        loose.issuers.insert(ti.did.clone(), ti);
+        let fixed = loose.revalidated().unwrap();
+        assert!(fixed.issuers.contains_key(TI));
+        assert_eq!(fixed.get(TI).unwrap().accredited_by.as_deref(), Some(TAO));
+
+        let mut dup = three_tier();
+        let mut twin = dup.get(TI).unwrap().clone();
+        twin.did = "did:web:ISSUER.example".into();
+        dup.issuers.insert(twin.did.clone(), twin);
+        assert_eq!(dup.revalidated(), Err(RegistryError::Duplicate(TI.into())));
+    }
+
+    #[test]
+    fn is_did_follows_the_did_core_syntax() {
+        for valid in [
+            "did:web:issuer.example",
+            "did:web:localhost%3A8443",
+            "did:web:example.com:user:alice",
+            "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+            "did:ebsi:zabc",
+            "did:x::a",
+            "did:web:a_b-c.d",
+        ] {
+            assert!(is_did(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            "did:web:x.example#key-1",
+            "did:web:x.example?versionId=1",
+            "did:web:x.example/path",
+            "did:web:x example",
+            "did:web:x.example:",
+            "did:web:",
+            "did::x",
+            "did:Web:x.example",
+            "did:web",
+            "did:web:x.example%3",
+            "did:web:x.example%zz",
+            "did:web:x.example%",
+            "did:web:ex\u{e4}mple",
+            "DID:web:x.example",
+        ] {
+            assert!(!is_did(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn upsert_refuses_a_did_url() {
+        let mut r = three_tier();
+        let url = "did:web:x.example#key-1";
+        assert_eq!(
+            r.upsert(
+                record(url, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                2
+            ),
+            Err(RegistryError::InvalidDid(url.into()))
+        );
+        assert_eq!(r.version, 3);
     }
 
     #[test]
