@@ -767,6 +767,47 @@ mod tests {
     }
 
     #[test]
+    fn canonical_did_keeps_case_after_an_encoded_delimiter() {
+        // `%2F`, `%40`, `%3F`, `%23` in the host segment decode to a path,
+        // userinfo or query, which are case-sensitive, so two spellings that
+        // differ only there can name different parties and must stay apart.
+        for (a, b) in [
+            ("did:web:example.com%2FAlice", "did:web:example.com%2Falice"),
+            ("did:web:example.com%40Bob", "did:web:example.com%40bob"),
+            (
+                "did:web:example.com%3FUser%3DBob",
+                "did:web:example.com%3Fuser%3Dbob",
+            ),
+            ("did:web:example.com%23Frag", "did:web:example.com%23frag"),
+        ] {
+            assert_ne!(canonical_did(a), canonical_did(b), "{a} vs {b}");
+            assert_eq!(canonical_did(a), a, "{a} is already canonical");
+        }
+        // The DNS host in front of the escape is still folded.
+        assert_eq!(
+            canonical_did("did:web:Example.COM%2fAlice"),
+            "did:web:example.com%2FAlice"
+        );
+    }
+
+    #[test]
+    fn upsert_does_not_merge_case_variants_of_an_encoded_path() {
+        let mut r = three_tier();
+        let before = r.issuers.len();
+        for did in [
+            "did:web:tenant.example%2FAlice",
+            "did:web:tenant.example%2Falice",
+        ] {
+            r.upsert(
+                record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                2,
+            )
+            .unwrap();
+        }
+        assert_eq!(r.issuers.len(), before + 2);
+    }
+
+    #[test]
     fn lookups_accept_non_canonical_dids() {
         let mut r = Registry::default();
         r.upsert(record(ROOT, Role::RootTao, &["*"], None), 1)
