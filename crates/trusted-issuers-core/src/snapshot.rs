@@ -24,6 +24,10 @@ use crate::registry::{Registry, TrustDecision};
 /// the same key signs.
 pub const SNAPSHOT_TYP: &str = "trust-list+jwt";
 
+/// How far in the future a snapshot's `iat` may be, in seconds, before
+/// [`verify_snapshot`] refuses it as not yet valid.
+pub const SNAPSHOT_CLOCK_SKEW_SECS: u64 = 60;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotPayload {
     pub iss: String,
@@ -47,6 +51,8 @@ pub enum SnapshotError {
     BadSignature(String),
     #[error("snapshot expired at {0}")]
     Expired(u64),
+    #[error("snapshot is issued in the future (iat {0})")]
+    NotYetValid(u64),
 }
 
 /// Signs the registry's current contents, valid for `ttl_secs` from `now`.
@@ -224,6 +230,51 @@ mod tests {
                 .check("did:web:authority.example", "Anything", 1060)
                 .trusted
         );
+    }
+
+    /// Signs a hand-built payload the way `sign_snapshot` does.
+    fn token_with_times(key: &DcpKeyPair, iat: u64, exp: u64) -> String {
+        let payload = SnapshotPayload {
+            iss: key.own_did.clone(),
+            iat,
+            exp,
+            version: 1,
+            issuers: registry().list().cloned().collect(),
+        };
+        sign_with_typ(&serde_json::to_value(&payload).unwrap(), key)
+    }
+
+    #[test]
+    fn iat_within_the_clock_skew_is_accepted() {
+        let key = DcpKeyPair::generate(REGISTRY_DID.into());
+        let token = token_with_times(&key, 1000 + SNAPSHOT_CLOCK_SKEW_SECS, 5000);
+        assert!(verify_snapshot(&token, REGISTRY_DID, &vk(&key), 1000).is_ok());
+    }
+
+    #[test]
+    fn iat_beyond_the_clock_skew_is_not_yet_valid() {
+        let key = DcpKeyPair::generate(REGISTRY_DID.into());
+        let iat = 1000 + SNAPSHOT_CLOCK_SKEW_SECS + 1;
+        let token = token_with_times(&key, iat, 5000);
+        assert_eq!(
+            verify_snapshot(&token, REGISTRY_DID, &vk(&key), 1000).unwrap_err(),
+            SnapshotError::NotYetValid(iat)
+        );
+    }
+
+    #[test]
+    fn iat_at_or_after_exp_is_malformed() {
+        let key = DcpKeyPair::generate(REGISTRY_DID.into());
+        for (iat, exp) in [(2000, 2000), (2001, 2000)] {
+            let token = token_with_times(&key, iat, exp);
+            assert!(
+                matches!(
+                    verify_snapshot(&token, REGISTRY_DID, &vk(&key), 1990),
+                    Err(SnapshotError::Malformed(_))
+                ),
+                "iat {iat} exp {exp}"
+            );
+        }
     }
 
     #[test]
