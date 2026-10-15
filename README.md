@@ -64,6 +64,12 @@ A record's `did` must be a bare DID per DID Core syntax. DID URLs
 (with a `#fragment`, `?query` or `/path`), spaces, a trailing `:` and
 malformed `%` escapes are refused with 422.
 
+**Upgrading.** On startup, data files and snapshots are re-checked under
+this DID syntax and canonical form. A record whose DID is now invalid (for
+example one with a `#fragment`) or that collapses into another record makes
+startup fail with an error naming the DID; fix or remove it in the file
+before upgrading.
+
 ## API
 
 Public reads, no authentication:
