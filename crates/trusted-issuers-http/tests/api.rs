@@ -552,3 +552,35 @@ async fn dids_are_canonicalized_on_write_and_lookup() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn did_urls_and_malformed_dids_are_refused_with_422() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+
+    // The README promises 422 for these; pin it so a status-mapping change
+    // for `InvalidDid` can't silently break the documented behaviour.
+    for did in [
+        "did:web:x.example%23key-1",
+        "did:web:x.example%3Fq=1",
+        "did:web:x.example:",
+        "did:web:x.example%20y",
+        "did:web:x.example%zz",
+    ] {
+        let (status, body, _) = call(
+            &s,
+            "PUT",
+            &format!("/v1/issuers/{did}"),
+            Some(TOKEN),
+            Some(json!({
+                "role": "ti", "credentialTypes": ["MembershipCredential"],
+                "accreditedBy": TAO, "status": "active"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{did}: {body}");
+    }
+
+    let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(body["total"], 3);
+}
