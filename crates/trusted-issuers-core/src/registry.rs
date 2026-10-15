@@ -362,9 +362,13 @@ impl Registry {
 /// separator) are the same byte either way. Without one spelling, a record
 /// written as `did:web:Issuer.example` would never match a credential whose
 /// issuer says `did:web:issuer.example`, silently distrusting a listed
-/// issuer. So for `did:web` the host (first segment) is lowercased and every
-/// percent-escape's hex digits are uppercased. Path segments keep their case
-/// because servers treat paths as case-sensitive. Other methods define their
+/// issuer. So for `did:web` the DNS host (the first segment up to its first
+/// `%` escape) is lowercased and every percent-escape's hex digits are
+/// uppercased. Everything else keeps its case: path segments, and anything
+/// after an escape in the first segment, because a resolver that decodes
+/// `%2F`, `%40`, `%3F` or `%23` turns that text into a path, userinfo or
+/// query, which servers treat as case-sensitive. Folding it would merge
+/// records of different parties. Other methods define their
 /// own equivalence, so they are returned unchanged.
 pub fn canonical_did(did: &str) -> String {
     let Some(rest) = did.strip_prefix("did:web:") else {
@@ -375,7 +379,15 @@ pub fn canonical_did(did: &str) -> String {
         .enumerate()
         .map(|(i, segment)| {
             if i == 0 {
-                uppercase_escapes(&segment.to_ascii_lowercase())
+                let (host, tail) = segment.split_at(segment.find('%').unwrap_or(segment.len()));
+                if host
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+                {
+                    uppercase_escapes(&(host.to_ascii_lowercase() + tail))
+                } else {
+                    uppercase_escapes(segment)
+                }
             } else {
                 uppercase_escapes(segment)
             }
