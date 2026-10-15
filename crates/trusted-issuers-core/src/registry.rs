@@ -825,6 +825,53 @@ mod tests {
     }
 
     #[test]
+    fn is_did_follows_the_did_core_syntax() {
+        for valid in [
+            "did:web:issuer.example",
+            "did:web:localhost%3A8443",
+            "did:web:example.com:user:alice",
+            "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
+            "did:ebsi:zabc",
+            "did:x::a",
+            "did:web:a_b-c.d",
+        ] {
+            assert!(is_did(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            "did:web:x.example#key-1",
+            "did:web:x.example?versionId=1",
+            "did:web:x.example/path",
+            "did:web:x example",
+            "did:web:x.example:",
+            "did:web:",
+            "did::x",
+            "did:Web:x.example",
+            "did:web",
+            "did:web:x.example%3",
+            "did:web:x.example%zz",
+            "did:web:x.example%",
+            "did:web:ex\u{e4}mple",
+            "DID:web:x.example",
+        ] {
+            assert!(!is_did(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn upsert_refuses_a_did_url() {
+        let mut r = three_tier();
+        let url = "did:web:x.example#key-1";
+        assert_eq!(
+            r.upsert(
+                record(url, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                2
+            ),
+            Err(RegistryError::InvalidDid(url.into()))
+        );
+        assert_eq!(r.version, 3);
+    }
+
+    #[test]
     fn serializes_as_a_list() {
         let r = three_tier();
         let json = serde_json::to_value(&r).unwrap();
