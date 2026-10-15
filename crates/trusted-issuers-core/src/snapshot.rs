@@ -25,7 +25,8 @@ use crate::registry::{Registry, TrustDecision};
 pub const SNAPSHOT_TYP: &str = "trust-list+jwt";
 
 /// How far in the future a snapshot's `iat` may be, in seconds, before
-/// [`verify_snapshot`] refuses it as not yet valid.
+/// [`verify_snapshot`] refuses it as not yet valid. Covers ordinary clock
+/// drift between the registry and a verifier.
 pub const SNAPSHOT_CLOCK_SKEW_SECS: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,8 +145,20 @@ pub fn verify_snapshot(
     if payload.iss != expected_iss {
         return Err(SnapshotError::WrongIssuer(payload.iss));
     }
+    if payload.iat >= payload.exp {
+        return Err(SnapshotError::Malformed(format!(
+            "iat {} is not before exp {}",
+            payload.iat, payload.exp
+        )));
+    }
     if now >= payload.exp {
         return Err(SnapshotError::Expired(payload.exp));
+    }
+    // A signed `iat` in the future means the registry's clock is wrong or
+    // the token was minted ahead of time; either way its `exp` window can't
+    // be trusted to start now, so allow only a little clock skew.
+    if payload.iat > now.saturating_add(SNAPSHOT_CLOCK_SKEW_SECS) {
+        return Err(SnapshotError::NotYetValid(payload.iat));
     }
     let mut issuers = std::collections::BTreeMap::new();
     for record in payload.issuers {

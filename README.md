@@ -113,7 +113,9 @@ A verifier fetches it once, verifies it against the key in the registry's
 DID document, and answers trust checks locally until `exp`, with no call to
 the registry per credential. `version` increases on every write, so a
 verifier can tell whether its copy is stale. `verify_snapshot` also
-re-applies the write rules to the contents. Responses carry
+re-applies the write rules to the contents, refuses an expired snapshot, one
+whose `iat` is not before `exp`, and one whose `iat` is more than
+`SNAPSHOT_CLOCK_SKEW_SECS` (60) in the future. Responses carry
 `Cache-Control: max-age` of a quarter of the TTL, so shared caches never
 hand out a nearly expired snapshot. `trusted-issuers-core` has no
 network code, so a verifier can embed it directly (sketch, error handling
