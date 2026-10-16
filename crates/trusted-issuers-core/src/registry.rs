@@ -447,8 +447,8 @@ fn is_did(s: &str) -> bool {
 }
 
 /// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
-/// host made of DNS characters (`[A-Za-z0-9.-]`) and the port a decimal
-/// 1-65535 (the same rule `--did-host` applies to the registry's own DID).
+/// host an [`is_dns_name`] and the port an [`is_port`] (the same rules
+/// `--did-host` applies to the registry's own DID).
 ///
 /// The did:web method only percent-encodes the `:` before a port. Any other
 /// escape (`%2F`, `%40`, `%2E`, ...) decodes to a path, userinfo or a
@@ -460,17 +460,47 @@ fn is_did_web_host(segment: &str) -> bool {
         Some(i) => (&segment[..i], Some(&segment[i..])),
         None => (segment, None),
     };
-    let host_ok = !host.is_empty()
-        && host
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'));
-    let port_ok = port.is_none_or(|p| {
-        p.get(..3)
-            .is_some_and(|sep| sep.eq_ignore_ascii_case("%3A"))
-            && p[3..].bytes().all(|c| c.is_ascii_digit())
-            && p[3..].parse::<u16>().is_ok_and(|port| port > 0)
-    });
-    host_ok && port_ok
+    is_dns_name(host)
+        && port.is_none_or(|p| {
+            p.get(..3)
+                .is_some_and(|sep| sep.eq_ignore_ascii_case("%3A"))
+                && is_port(&p[3..])
+        })
+}
+
+/// Whether `host` is a DNS host name that did:web can use: dot-separated
+/// labels of `[A-Za-z0-9-]`, each 1-63 characters and not starting or
+/// ending with `-`, and not an IPv4 address.
+///
+/// Empty labels are refused, including the trailing root dot: `example.com.`
+/// resolves like `example.com`, so accepting it would let one party be
+/// listed twice. The did:web method forbids IP addresses, so a name whose
+/// last label is all digits is refused too.
+pub fn is_dns_name(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    host.len() <= 253
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+        && labels
+            .last()
+            .is_some_and(|last| !last.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether `port` is a TCP port written one way only: decimal digits, no
+/// leading zero, 1-65535. `08443` is the same port as `8443`, so accepting
+/// it would give a did:web party a second spelling.
+pub fn is_port(port: &str) -> bool {
+    !port.is_empty()
+        && !port.starts_with('0')
+        && port.bytes().all(|c| c.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 /// [`is_did`]'s method-independent part: the DID Core ABNF.
