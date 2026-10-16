@@ -1004,6 +1004,68 @@ mod tests {
     }
 
     #[test]
+    fn did_web_host_follows_dns_label_rules() {
+        let label_63 = "a".repeat(63);
+        let label_64 = "a".repeat(64);
+        for valid in [
+            "did:web:localhost".to_string(),
+            "did:web:a-b.example".to_string(),
+            "did:web:xn--bcher-kva.example".to_string(),
+            "did:web:1password.example".to_string(),
+            format!("did:web:{label_63}.example"),
+        ] {
+            assert!(is_did(&valid), "{valid} should be valid");
+        }
+        for invalid in [
+            // Empty labels, including the trailing root dot that makes
+            // `example.com.` a second spelling of `example.com`.
+            "did:web:example.com.".to_string(),
+            "did:web:.".to_string(),
+            "did:web:.example.com".to_string(),
+            "did:web:a..b".to_string(),
+            // Hyphens may not start or end a label.
+            "did:web:-".to_string(),
+            "did:web:-a-.example".to_string(),
+            "did:web:a.example-".to_string(),
+            format!("did:web:{label_64}.example"),
+            // The did:web method-specific id must not be an IP address.
+            "did:web:127.0.0.1".to_string(),
+            "did:web:127.0.0.1%3A8443".to_string(),
+            // A leading zero is a second spelling of the same port.
+            "did:web:localhost%3A08443".to_string(),
+            "did:web:localhost%3A00".to_string(),
+        ] {
+            assert!(!is_did(&invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn a_party_cannot_be_stored_under_a_second_host_spelling() {
+        let mut r = three_tier();
+        for (first, second) in [
+            (
+                "did:web:tenant.example%3A8443",
+                "did:web:tenant.example%3A08443",
+            ),
+            ("did:web:other.example", "did:web:other.example."),
+        ] {
+            r.upsert(
+                record(first, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                2,
+            )
+            .unwrap();
+            assert_eq!(
+                r.upsert(
+                    record(second, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                    2
+                ),
+                Err(RegistryError::InvalidDid(second.into()))
+            );
+        }
+        assert_eq!(r.issuers.len(), 5);
+    }
+
+    #[test]
     fn upsert_refuses_an_encoded_delimiter_in_the_did_web_host() {
         let mut r = three_tier();
         assert_eq!(

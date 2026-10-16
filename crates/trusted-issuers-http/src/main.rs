@@ -179,6 +179,11 @@ mod tests {
             "host:99999",
             "-a.example",
             "a..b",
+            // A leading zero would spell the same port a second way.
+            "localhost:08090",
+            // did:web DIDs must not be IP addresses.
+            "127.0.0.1",
+            "127.0.0.1:8090",
         ] {
             assert!(did_from_host(bad).is_err(), "{bad}");
         }
