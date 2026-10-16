@@ -870,6 +870,26 @@ mod tests {
     }
 
     #[test]
+    fn a_lookup_with_an_escaped_host_never_matches_a_stored_host() {
+        // Such DIDs can't be stored (is_did refuses them), but lookups take
+        // any string. Canonicalizing one must not land on a listed host.
+        let r = three_tier();
+        for spelling in [
+            "did:web:TAO.example%2F",
+            "did:web:tao.example%2Fx",
+            "did:web:tao.example%40",
+            "did:web:tao.example%3F",
+        ] {
+            assert!(r.get(spelling).is_none(), "{spelling}");
+            assert!(
+                !r.check(spelling, "MembershipCredential", 10).trusted,
+                "{spelling}"
+            );
+        }
+        assert!(r.get("did:web:TAO.example").is_some());
+    }
+
+    #[test]
     fn lookups_accept_non_canonical_dids() {
         let mut r = Registry::default();
         r.upsert(record(ROOT, Role::RootTao, &["*"], None), 1)
