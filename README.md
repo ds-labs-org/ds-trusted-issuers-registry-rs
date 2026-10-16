@@ -55,10 +55,10 @@ canonical form: the DNS host is lowercased and the hex digits of
 percent-escapes are uppercased (`did:web:Host.example%3a8443` is
 `did:web:host.example%3A8443`; path segments keep their case). It applies
 to `did` and `accreditedBy` on write and to the DID in every read, check
-and status change, so a record
-matches however a credential spells its issuer. Other DID methods are
-compared as given. Two records that collapse to the same DID in a loaded
-data file or snapshot are refused as duplicates.
+and status change, so a record matches however a credential spells its
+issuer. Other DID methods are compared as given. Two records that collapse
+to the same DID in a loaded data file or snapshot are refused as
+duplicates.
 
 A record's `did` must be a bare DID per DID Core syntax. DID URLs
 (with a `#fragment`, `?query` or `/path`), spaces, a trailing `:` and

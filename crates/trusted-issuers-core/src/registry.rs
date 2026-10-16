@@ -364,12 +364,13 @@ impl Registry {
 /// issuer says `did:web:issuer.example`, silently distrusting a listed
 /// issuer. So for `did:web` the DNS host (the first segment up to its first
 /// `%` escape) is lowercased and every percent-escape's hex digits are
-/// uppercased. Everything else keeps its case: path segments, and anything
-/// after an escape in the first segment, because a resolver that decodes
-/// `%2F`, `%40`, `%3F` or `%23` turns that text into a path, userinfo or
-/// query, which servers treat as case-sensitive. Folding it would merge
-/// records of different parties. Other methods define their
-/// own equivalence, so they are returned unchanged.
+/// uppercased. Path segments keep their case, and so does anything after an
+/// escape in the first segment. [`is_did`] refuses every escape there except
+/// the port's `%3A`, so no stored DID has such text. But lookups take any
+/// string, and a resolver that decodes `%2F`, `%40`, `%3F` or `%23` would
+/// turn it into a case-sensitive path, userinfo or query. Keeping its case
+/// means such a lookup never lands on a listed host. Other methods define
+/// their own equivalence, so they are returned unchanged.
 pub fn canonical_did(did: &str) -> String {
     let Some(rest) = did.strip_prefix("did:web:") else {
         return did.to_string();
@@ -443,7 +444,7 @@ fn uppercase_escapes(s: &str) -> String {
 fn is_did(s: &str) -> bool {
     is_did_core(s)
         && s.strip_prefix("did:web:")
-            .is_none_or(|rest| is_did_web_host(rest.split(':').next().unwrap_or_default()))
+            .is_none_or(|rest| is_did_web_host(rest.split_once(':').map_or(rest, |(host, _)| host)))
 }
 
 /// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
@@ -848,8 +849,9 @@ mod tests {
     #[test]
     fn canonical_did_keeps_case_after_an_encoded_delimiter() {
         // `%2F`, `%40`, `%3F`, `%23` in the host segment decode to a path,
-        // userinfo or query, which are case-sensitive, so two spellings that
-        // differ only there can name different parties and must stay apart.
+        // userinfo or query, which are case-sensitive. is_did refuses them
+        // on write, but a lookup spelled this way must not be folded into
+        // another spelling (see the escaped-host lookup test below).
         for (a, b) in [
             ("did:web:example.com%2FAlice", "did:web:example.com%2Falice"),
             ("did:web:example.com%40Bob", "did:web:example.com%40bob"),
