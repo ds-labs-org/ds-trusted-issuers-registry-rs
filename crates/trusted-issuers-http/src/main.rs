@@ -6,6 +6,7 @@ use clap::Parser;
 use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
+use trusted_issuers_core::{is_dns_name, is_port};
 use trusted_issuers_http::{AppState, load, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
@@ -52,25 +53,17 @@ struct Cli {
     snapshot_ttl_secs: u64,
 }
 
-/// `host` or `host:port`, lowercased: DNS labels of `[a-z0-9-]` and an
-/// optional numeric port. Anything else would produce a `did:web` nobody
-/// can resolve, so it is refused at startup.
+/// `host` or `host:port`, lowercased, checked with the same
+/// [`is_dns_name`]/[`is_port`] rules the registry applies to every did:web
+/// it stores. Anything else would produce a `did:web` nobody can resolve,
+/// or the registry itself would refuse, so it is refused at startup.
 fn did_from_host(host: &str) -> Result<String, String> {
     let host = host.trim().to_ascii_lowercase();
     let (name, port) = match host.rsplit_once(':') {
         Some((name, port)) => (name, Some(port)),
         None => (host.as_str(), None),
     };
-    let name_ok = !name.is_empty()
-        && name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-        });
-    let port_ok = port.is_none_or(|p| p.parse::<u16>().is_ok_and(|p| p > 0));
-    if !name_ok || !port_ok {
+    if !is_dns_name(name) || !port.is_none_or(is_port) {
         return Err(format!(
             "--did-host '{host}' must be a host name with an optional port, e.g. registry.example or localhost:8090"
         ));
@@ -179,6 +172,11 @@ mod tests {
             "host:99999",
             "-a.example",
             "a..b",
+            // A leading zero would spell the same port a second way.
+            "localhost:08090",
+            // did:web DIDs must not be IP addresses.
+            "127.0.0.1",
+            "127.0.0.1:8090",
         ] {
             assert!(did_from_host(bad).is_err(), "{bad}");
         }

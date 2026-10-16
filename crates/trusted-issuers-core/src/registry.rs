@@ -437,7 +437,74 @@ fn uppercase_escapes(s: &str) -> String {
 /// accepting one would store a record no credential's issuer DID can match.
 /// Empty segments between colons are legal in the grammar, a trailing colon
 /// is not.
+///
+/// `did:web` is stricter: its first segment is a DNS host, optionally
+/// followed by `%3A` and a port (see [`is_did_web_host`]).
 fn is_did(s: &str) -> bool {
+    is_did_core(s)
+        && s.strip_prefix("did:web:")
+            .is_none_or(|rest| is_did_web_host(rest.split(':').next().unwrap_or_default()))
+}
+
+/// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
+/// host an [`is_dns_name`] and the port an [`is_port`] (the same rules
+/// `--did-host` applies to the registry's own DID).
+///
+/// The did:web method only percent-encodes the `:` before a port. Any other
+/// escape (`%2F`, `%40`, `%2E`, ...) decodes to a path, userinfo or a
+/// character a resolver may or may not decode, so the same party could be
+/// spelled several ways that [`canonical_did`] can't safely merge; such a
+/// DID is refused instead of stored under one spelling.
+fn is_did_web_host(segment: &str) -> bool {
+    let (host, port) = match segment.find('%') {
+        Some(i) => (&segment[..i], Some(&segment[i..])),
+        None => (segment, None),
+    };
+    is_dns_name(host)
+        && port.is_none_or(|p| {
+            p.get(..3)
+                .is_some_and(|sep| sep.eq_ignore_ascii_case("%3A"))
+                && is_port(&p[3..])
+        })
+}
+
+/// Whether `host` is a DNS host name that did:web can use: dot-separated
+/// labels of `[A-Za-z0-9-]`, each 1-63 characters and not starting or
+/// ending with `-`, and not an IPv4 address.
+///
+/// Empty labels are refused, including the trailing root dot: `example.com.`
+/// resolves like `example.com`, so accepting it would let one party be
+/// listed twice. The did:web method forbids IP addresses, so a name whose
+/// last label is all digits is refused too.
+pub fn is_dns_name(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    host.len() <= 253
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+        && labels
+            .last()
+            .is_some_and(|last| !last.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether `port` is a TCP port written one way only: decimal digits, no
+/// leading zero, 1-65535. `08443` is the same port as `8443`, so accepting
+/// it would give a did:web party a second spelling.
+pub fn is_port(port: &str) -> bool {
+    !port.is_empty()
+        && !port.starts_with('0')
+        && port.bytes().all(|c| c.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+/// [`is_did`]'s method-independent part: the DID Core ABNF.
+fn is_did_core(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("did:") else {
         return false;
     };
@@ -803,23 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_does_not_merge_case_variants_of_an_encoded_path() {
-        let mut r = three_tier();
-        let before = r.issuers.len();
-        for did in [
-            "did:web:tenant.example%2FAlice",
-            "did:web:tenant.example%2Falice",
-        ] {
-            r.upsert(
-                record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
-                2,
-            )
-            .unwrap();
-        }
-        assert_eq!(r.issuers.len(), before + 2);
-    }
-
-    #[test]
     fn lookups_accept_non_canonical_dids() {
         let mut r = Registry::default();
         r.upsert(record(ROOT, Role::RootTao, &["*"], None), 1)
@@ -922,7 +972,7 @@ mod tests {
             "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
             "did:ebsi:zabc",
             "did:x::a",
-            "did:web:a_b-c.d",
+            "did:x:a_b-c.d",
         ] {
             assert!(is_did(valid), "{valid} should be valid");
         }
@@ -944,6 +994,125 @@ mod tests {
         ] {
             assert!(!is_did(invalid), "{invalid} should be invalid");
         }
+    }
+
+    #[test]
+    fn did_web_host_is_a_dns_name_with_an_optional_port() {
+        for valid in [
+            "did:web:Issuer.Example",
+            "did:web:localhost%3A8443",
+            "did:web:localhost%3a8443",
+            "did:web:localhost%3A1",
+            "did:web:localhost%3A65535",
+            "did:web:example.com:user%2Dx:Alice",
+        ] {
+            assert!(is_did(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            // Escapes other than the port separator decode to something
+            // that is not part of a DNS host.
+            "did:web:example.com%2FAlice",
+            "did:web:user%40example.com",
+            "did:web:%49ssuer.example",
+            "did:web:issuer%2Eexample",
+            // The port separator needs a port, and only one.
+            "did:web:localhost%3A",
+            "did:web:localhost%3Ahttp",
+            "did:web:localhost%3A80%3A81",
+            "did:web:%3A8443",
+            // A port is 1-65535, as `--did-host` requires for the
+            // registry's own DID.
+            "did:web:localhost%3A0",
+            "did:web:localhost%3A65536",
+            "did:web:localhost%3A99999",
+            "did:web:localhost%3A123456789012345678901234567890",
+            // Not DNS host characters.
+            "did:web:a_b.example",
+        ] {
+            assert!(!is_did(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn did_web_host_follows_dns_label_rules() {
+        let label_63 = "a".repeat(63);
+        let label_64 = "a".repeat(64);
+        for valid in [
+            "did:web:localhost".to_string(),
+            "did:web:a-b.example".to_string(),
+            "did:web:xn--bcher-kva.example".to_string(),
+            "did:web:1password.example".to_string(),
+            format!("did:web:{label_63}.example"),
+        ] {
+            assert!(is_did(&valid), "{valid} should be valid");
+        }
+        for invalid in [
+            // Empty labels, including the trailing root dot that makes
+            // `example.com.` a second spelling of `example.com`.
+            "did:web:example.com.".to_string(),
+            "did:web:.".to_string(),
+            "did:web:.example.com".to_string(),
+            "did:web:a..b".to_string(),
+            // Hyphens may not start or end a label.
+            "did:web:-".to_string(),
+            "did:web:-a-.example".to_string(),
+            "did:web:a.example-".to_string(),
+            format!("did:web:{label_64}.example"),
+            // The did:web method-specific id must not be an IP address.
+            "did:web:127.0.0.1".to_string(),
+            "did:web:127.0.0.1%3A8443".to_string(),
+            // A leading zero is a second spelling of the same port.
+            "did:web:localhost%3A08443".to_string(),
+            "did:web:localhost%3A00".to_string(),
+        ] {
+            assert!(!is_did(&invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn a_party_cannot_be_stored_under_a_second_host_spelling() {
+        let mut r = three_tier();
+        for (first, second) in [
+            (
+                "did:web:tenant.example%3A8443",
+                "did:web:tenant.example%3A08443",
+            ),
+            ("did:web:other.example", "did:web:other.example."),
+        ] {
+            r.upsert(
+                record(first, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                2,
+            )
+            .unwrap();
+            assert_eq!(
+                r.upsert(
+                    record(second, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                    2
+                ),
+                Err(RegistryError::InvalidDid(second.into()))
+            );
+        }
+        assert_eq!(r.issuers.len(), 5);
+    }
+
+    #[test]
+    fn upsert_refuses_an_encoded_delimiter_in_the_did_web_host() {
+        let mut r = three_tier();
+        assert_eq!(
+            r.upsert(
+                record(
+                    "did:web:tenant.example%2FAlice",
+                    Role::Ti,
+                    &["MembershipCredential"],
+                    Some(TAO)
+                ),
+                2
+            ),
+            Err(RegistryError::InvalidDid(
+                "did:web:tenant.example%2FAlice".into()
+            ))
+        );
+        assert_eq!(r.version, 3);
     }
 
     #[test]

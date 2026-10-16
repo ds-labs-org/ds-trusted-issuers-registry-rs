@@ -53,22 +53,32 @@ others can't be removed or demoted to `ti`. Failed writes change nothing.
 **DID canonicalization.** `did:web` DIDs are stored and looked up in one
 canonical form: the DNS host is lowercased and the hex digits of
 percent-escapes are uppercased (`did:web:Host.example%3a8443` is
-`did:web:host.example%3A8443`; path segments, and text after an encoded
-delimiter such as `%2F` in the host segment, keep their case). It applies to `did` and `accreditedBy` on
-write and to the DID in every read, check and status change, so a record
+`did:web:host.example%3A8443`; path segments keep their case). It applies
+to `did` and `accreditedBy` on write and to the DID in every read, check
+and status change, so a record
 matches however a credential spells its issuer. Other DID methods are
 compared as given. Two records that collapse to the same DID in a loaded
 data file or snapshot are refused as duplicates.
 
 A record's `did` must be a bare DID per DID Core syntax. DID URLs
 (with a `#fragment`, `?query` or `/path`), spaces, a trailing `:` and
-malformed `%` escapes are refused with 422.
+malformed `%` escapes are refused with 422. A `did:web` host must be a DNS
+name with an optional `%3A` and port, so that each party has one spelling:
+labels of `[A-Za-z0-9-]`, 1-63 characters, not starting or ending with
+`-`, no empty label or trailing dot (`example.com.`), and no IP address;
+the port is 1-65535 without leading zeros (`%3A08443`). Any other escape
+in the host (`did:web:example.com%2FAlice`) is refused too. `--did-host`
+applies the same rules to the registry's own DID.
 
 **Upgrading.** On startup, data files and snapshots are re-checked under
-this DID syntax and canonical form. A record whose DID is now invalid (for
-example one with a `#fragment`) or that collapses into another record makes
-startup fail with an error naming the DID; fix or remove it in the file
-before upgrading.
+this DID syntax and canonical form. A record whose DID is now invalid or
+that collapses into another record makes startup fail with an error naming
+the DID; fix or remove it in the file before upgrading. Besides DID URLs
+(`#fragment`, `?query`), that covers `did:web` hosts that earlier versions
+accepted: escapes other than the port's `%3A` (`%2F`, `%40`, ...), `_`,
+empty or hyphen-edged labels, a trailing dot, IP addresses, and ports that
+are 0, above 65535 or written with leading zeros. `--did-host` likewise
+refuses an IP address or a port with leading zeros.
 
 ## API
 
