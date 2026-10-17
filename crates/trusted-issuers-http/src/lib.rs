@@ -44,7 +44,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 use trusted_issuers_core::{
-    IssuerRecord, Registry, RegistryError, Role, Status, canonical_did, sign_snapshot,
+    IdKind, IssuerRecord, Registry, RegistryError, Role, Status, canonical_id, sign_snapshot,
 };
 
 pub const SNAPSHOT_CONTENT_TYPE: &str = "application/trust-list+jwt";
@@ -260,6 +260,7 @@ struct ListQuery {
     credential_type: Option<String>,
     role: Option<Role>,
     status: Option<Status>,
+    id_kind: Option<IdKind>,
 }
 
 async fn list_issuers(
@@ -272,6 +273,7 @@ async fn list_issuers(
         .filter(|r| query.credential_type.as_deref().is_none_or(|t| r.covers(t)))
         .filter(|r| query.role.is_none_or(|role| r.role == role))
         .filter(|r| query.status.is_none_or(|status| r.status == status))
+        .filter(|r| query.id_kind.is_none_or(|kind| IdKind::of(&r.id) == kind))
         .collect();
     Json(json!({"version": registry.version, "total": items.len(), "items": items}))
 }
@@ -351,12 +353,12 @@ async fn put_issuer(
 ) -> Response {
     // Compare and store the canonical form, so the path and body may spell
     // the same DID differently.
-    let id = canonical_did(&id);
+    let id = canonical_id(&id);
     let body = match body {
         Ok(Json(b)) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
-    if body.id.as_deref().is_some_and(|d| canonical_did(d) != id) {
+    if body.id.as_deref().is_some_and(|d| canonical_id(d) != id) {
         return error(StatusCode::BAD_REQUEST, "body id does not match the path").into_response();
     }
     let record = IssuerRecord {

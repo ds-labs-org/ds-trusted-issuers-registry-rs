@@ -7,9 +7,9 @@ pub mod model;
 pub mod registry;
 pub mod snapshot;
 
-pub use model::{ANY_CREDENTIAL_TYPE, IssuerRecord, Role, Status};
+pub use model::{ANY_CREDENTIAL_TYPE, IdKind, IssuerRecord, Role, Status};
 pub use registry::{
-    MAX_CHAIN_DEPTH, Registry, RegistryError, TrustDecision, canonical_did,
+    MAX_CHAIN_DEPTH, Registry, RegistryError, TrustDecision, canonical_did, canonical_id,
     is_credential_issuer_id, is_did_web_port, is_dns_name, is_port,
 };
 pub use snapshot::{

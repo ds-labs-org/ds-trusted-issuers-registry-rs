@@ -44,6 +44,28 @@ pub enum Status {
     Revoked,
 }
 
+/// How a party is named, which follows from the protocol its credentials
+/// come through: DCP issuers (and anyone signing with a DID) by a DID, OID4VCI
+/// issuers by their https Credential Issuer Identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdKind {
+    Did,
+    Url,
+}
+
+impl IdKind {
+    /// The kind of a stored id. Ids are validated on write, so anything that
+    /// is not a DID is an https URL.
+    pub fn of(id: &str) -> Self {
+        if id.starts_with("did:") {
+            IdKind::Did
+        } else {
+            IdKind::Url
+        }
+    }
+}
+
 /// One party in the registry.
 ///
 /// `credential_types` means "may issue these types" for every role, and
