@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use chrono::NaiveDateTime;
 use contreforts_core::{ConnectorError, ContrefortsConnector, Document, EntityKind};
+use trusted_issuers_core::{AuditEntry, IdKind, IssuerRecord};
 use trusted_issuers_graph::RegistryGraph;
 
 /// A party in the registry; `remote_id` is its id (DID or URL).
@@ -22,7 +23,53 @@ pub const ISSUER_RECORD_KIND: &str = "ds-trusted-issuers-registry-rs:issuer-reco
 /// One audited write; `remote_id` is its sequence number.
 pub const AUDIT_ENTRY_KIND: &str = "ds-trusted-issuers-registry-rs:audit-entry";
 
+fn to_api_err(e: trusted_issuers_graph::GraphError) -> ConnectorError {
+    ConnectorError::Api {
+        message: e.to_string(),
+    }
+}
+
+/// Unix seconds as the naive UTC time Contreforts uses for `modified` and
+/// `since`.
+fn naive(unix: u64) -> Option<NaiveDateTime> {
+    chrono::DateTime::from_timestamp(i64::try_from(unix).ok()?, 0).map(|t| t.naive_utc())
+}
+
+fn record_document(kind: EntityKind, source: &str, record: &IssuerRecord) -> Document {
+    let mut fields = serde_json::to_value(record).expect("a record always serializes");
+    fields["idKind"] = serde_json::to_value(IdKind::of(&record.id)).expect("a unit enum");
+    Document {
+        name: record.name.clone().unwrap_or_else(|| record.id.clone()),
+        remote_id: record.id.clone(),
+        kind,
+        source: source.to_string(),
+        modified: naive(record.updated_at),
+        fields,
+    }
+}
+
+fn entry_document(kind: EntityKind, source: &str, entry: &AuditEntry) -> Document {
+    Document {
+        name: format!("audit entry {}: {:?} {}", entry.seq, entry.action, entry.id),
+        remote_id: entry.seq.to_string(),
+        kind,
+        source: source.to_string(),
+        modified: naive(entry.at),
+        fields: serde_json::to_value(entry).expect("an audit entry always serializes"),
+    }
+}
+
+/// Whether a change at `modified` is newer than `since` (everything is,
+/// without `since`).
+fn after(modified: Option<NaiveDateTime>, since: Option<NaiveDateTime>) -> bool {
+    since.is_none_or(|since| modified.is_some_and(|m| m > since))
+}
+
 /// Adapts a [`RegistryGraph`] to Contreforts' connector interface.
+/// Recognises exactly [`ISSUER_RECORD_KIND`] and [`AUDIT_ENTRY_KIND`]; any
+/// other kind is [`ConnectorError::UnsupportedKind`], never a silent empty
+/// result. `since` keeps records whose `updatedAt`, and entries whose time,
+/// is later.
 pub struct RegistryGraphConnector {
     graph: Arc<RegistryGraph>,
 }
@@ -30,6 +77,13 @@ pub struct RegistryGraphConnector {
 impl RegistryGraphConnector {
     pub fn new(graph: Arc<RegistryGraph>) -> Self {
         Self { graph }
+    }
+
+    fn unsupported_kind(&self, kind: &EntityKind) -> ConnectorError {
+        ConnectorError::UnsupportedKind {
+            connector: self.source_name().to_string(),
+            kind: kind.as_str().to_string(),
+        }
     }
 }
 
@@ -46,22 +100,56 @@ impl ContrefortsConnector for RegistryGraphConnector {
     async fn pull(
         &self,
         kind: EntityKind,
-        _since: Option<NaiveDateTime>,
+        since: Option<NaiveDateTime>,
     ) -> Result<Vec<Document>, ConnectorError> {
-        let _ = &self.graph;
-        Err(ConnectorError::Unsupported {
-            connector: self.source_name().to_string(),
-            operation: format!("pull (kind: {kind})"),
-        })
+        let source = self.source_name();
+        match kind.as_str() {
+            ISSUER_RECORD_KIND => {
+                let registry = self.graph.load().map_err(to_api_err)?;
+                Ok(registry
+                    .list()
+                    .map(|r| record_document(kind.clone(), source, r))
+                    .filter(|d| after(d.modified, since))
+                    .collect())
+            }
+            AUDIT_ENTRY_KIND => {
+                let entries = self.graph.audit().map_err(to_api_err)?;
+                Ok(entries
+                    .iter()
+                    .map(|e| entry_document(kind.clone(), source, e))
+                    .filter(|d| after(d.modified, since))
+                    .collect())
+            }
+            _ => Err(self.unsupported_kind(&kind)),
+        }
     }
 
-    async fn get(&self, kind: EntityKind, _remote_id: &str) -> Result<Document, ConnectorError> {
-        Err(ConnectorError::Unsupported {
-            connector: self.source_name().to_string(),
-            operation: format!("get (kind: {kind})"),
-        })
+    async fn get(&self, kind: EntityKind, remote_id: &str) -> Result<Document, ConnectorError> {
+        let not_found = || ConnectorError::NotFound {
+            kind: kind.as_str().to_string(),
+            id: remote_id.to_string(),
+        };
+        match kind.as_str() {
+            ISSUER_RECORD_KIND => {
+                let registry = self.graph.load().map_err(to_api_err)?;
+                let record = registry.get(remote_id).ok_or_else(not_found)?;
+                Ok(record_document(kind.clone(), self.source_name(), record))
+            }
+            AUDIT_ENTRY_KIND => {
+                let seq: u64 = remote_id.parse().map_err(|_| not_found())?;
+                let entry = self
+                    .graph
+                    .audit_entry(seq)
+                    .map_err(to_api_err)?
+                    .ok_or_else(not_found)?;
+                Ok(entry_document(kind.clone(), self.source_name(), &entry))
+            }
+            _ => Err(self.unsupported_kind(&kind)),
+        }
     }
 
+    /// Refused: a registry write must pass the registry's rules and land in
+    /// its audit log, which only the admin API does.
     async fn push(&self, doc: &Document) -> Result<Document, ConnectorError> {
         Err(ConnectorError::Unsupported {
             connector: self.source_name().to_string(),
@@ -73,9 +161,7 @@ impl ContrefortsConnector for RegistryGraphConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trusted_issuers_core::{
-        AuditAction, AuditEntry, AuditRecord, IssuerRecord, Registry, Role, Status,
-    };
+    use trusted_issuers_core::{AuditAction, AuditRecord, Registry, Role, Status};
 
     const ROOT: &str = "did:web:authority.example";
     const TI: &str = "https://issuer.example/tenants/acme";
