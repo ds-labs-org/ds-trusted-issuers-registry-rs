@@ -2456,17 +2456,21 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "contreforts-core",
  "ds-dcp-core-rs",
  "http-body-util",
  "p256",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "trusted-issuers-contreforts",
  "trusted-issuers-core",
+ "trusted-issuers-graph",
 ]
 
 [[package]]

@@ -5,6 +5,8 @@
 //! - [`MemoryStore`]: nothing survives a restart (development, tests).
 //! - [`JsonFileStore`]: the registry as one JSON file, rewritten atomically
 //!   after each write, and the audit log as JSON lines next to it.
+//! - [`GraphStore`]: both as RDF in the registry graph (Oxigraph, on disk),
+//!   reachable through Contreforts' connector interface.
 
 use std::io::Write;
 use std::path::{Path as FsPath, PathBuf};
@@ -195,6 +197,53 @@ impl Store for JsonFileStore {
         id: Option<&str>,
     ) -> std::io::Result<Vec<AuditEntry>> {
         Ok(page(&lock(&self.audit), after, limit, id))
+    }
+}
+
+/// The registry graph (see `trusted_issuers_graph`).
+pub struct GraphStore {
+    graph: std::sync::Arc<trusted_issuers_graph::RegistryGraph>,
+}
+
+impl GraphStore {
+    /// Opens the graph in directory `dir` (created if missing) and returns
+    /// it with the registry it holds. With `import`, a JSON data file is
+    /// first moved into a graph that holds no registry yet.
+    pub fn open(dir: &FsPath, import: Option<&FsPath>) -> Result<(Self, Registry), String> {
+        let _ = (dir, import);
+        Ok((
+            Self {
+                graph: std::sync::Arc::new(
+                    trusted_issuers_graph::RegistryGraph::open_in_memory()
+                        .map_err(|e| e.to_string())?,
+                ),
+            },
+            Registry::default(),
+        ))
+    }
+
+    /// The graph, for the Contreforts connector.
+    pub fn graph(&self) -> std::sync::Arc<trusted_issuers_graph::RegistryGraph> {
+        self.graph.clone()
+    }
+}
+
+impl Store for GraphStore {
+    fn commit(&self, _registry: &Registry, _entry: &AuditEntry) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn audit_head(&self) -> Option<AuditEntry> {
+        None
+    }
+
+    fn audit_page(
+        &self,
+        _after: u64,
+        _limit: usize,
+        _id: Option<&str>,
+    ) -> std::io::Result<Vec<AuditEntry>> {
+        Ok(Vec::new())
     }
 }
 

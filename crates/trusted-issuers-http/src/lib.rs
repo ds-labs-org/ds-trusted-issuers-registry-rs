@@ -50,7 +50,7 @@ use trusted_issuers_core::{
     Status, canonical_id, sign_snapshot,
 };
 
-pub use store::{JsonFileStore, MemoryStore, Store, audit_file, load, persist};
+pub use store::{GraphStore, JsonFileStore, MemoryStore, Store, audit_file, load, persist};
 
 pub const SNAPSHOT_CONTENT_TYPE: &str = "application/trust-list+jwt";
 

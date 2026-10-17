@@ -1086,3 +1086,74 @@ async fn the_audit_log_survives_a_restart_and_tampering_is_refused() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn graph_state(dir: &std::path::Path, import: Option<&std::path::Path>) -> Arc<AppState> {
+    let (store, registry) = trusted_issuers_http::GraphStore::open(dir, import).unwrap();
+    Arc::new(AppState::new(
+        registry,
+        DcpKeyPair::generate(REGISTRY_DID.into()),
+        Some(TOKEN.into()),
+        Arc::new(store),
+        600,
+    ))
+}
+
+#[tokio::test]
+async fn the_graph_store_keeps_the_registry_and_its_audit_log_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = graph_state(dir.path(), None);
+    seed_with_oid4vci(&s).await;
+    let (_, before, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    drop(s);
+
+    let s = graph_state(dir.path(), None);
+    let (_, after, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(after, before);
+    assert_eq!(after["total"], 5);
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}/types/{PID_VCT_PATH}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(body["trusted"], true, "{body}");
+
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{TI_PATH}/status"),
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body, _) = call(&s, "GET", "/v1/admin/audit", Some(TOKEN), None).await;
+    let entries = audit_entries(&body);
+    assert_eq!(entries.len(), 6, "{body}");
+    assert_eq!(trusted_issuers_core::verify_audit_chain(&entries), Ok(()));
+    assert_eq!(body["head"]["seq"], 6);
+}
+
+#[tokio::test]
+async fn a_json_data_file_is_imported_into_an_empty_graph_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("registry.json");
+    let s = state(Some(TOKEN), Some(file.clone()));
+    seed(&s).await;
+    drop(s);
+
+    let graph_dir = dir.path().join("graph");
+    let s = graph_state(&graph_dir, Some(&file));
+    let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["version"], 3);
+    drop(s);
+    // A graph that already holds a registry is not overwritten.
+    assert!(trusted_issuers_http::GraphStore::open(&graph_dir, Some(&file)).is_err());
+    // Reopening without import keeps what was imported.
+    let s = graph_state(&graph_dir, None);
+    let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(body["total"], 3);
+}
