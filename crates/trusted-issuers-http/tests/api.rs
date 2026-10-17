@@ -290,6 +290,47 @@ async fn writes_are_persisted_and_reloaded() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Narrowing an accreditor's scope is an accepted write that leaves its
+/// existing dependents out of scope. The registry must still restart from
+/// its own data file and its snapshots must still verify; `check` is what
+/// denies the out-of-scope dependents.
+#[tokio::test]
+async fn narrowing_an_accreditor_keeps_the_data_file_and_snapshots_usable() {
+    let dir = std::env::temp_dir().join(format!("tir-narrow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("registry.json");
+    let _ = std::fs::remove_file(&file);
+
+    let s = state(Some(TOKEN), Some(file.clone()));
+    seed(&s).await;
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{TAO}"),
+        Some(TOKEN),
+        Some(json!({"role": "tao", "credentialTypes": ["DataProcessorCredential"], "accreditedBy": ROOT, "status": "active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let reloaded = load(&file, false).expect("the registry restarts from its own file");
+    assert_eq!(reloaded, *s.registry.read().await);
+
+    let (status, token, _) = call(&s, "GET", "/v1/snapshot", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let token = token.as_str().unwrap();
+    let (_, doc, _) = call(&s, "GET", "/.well-known/did.json", None, None).await;
+    let doc = serde_json::from_value(doc).unwrap();
+    let key = find_verifying_key(&doc, &snapshot_kid(token).unwrap()).unwrap();
+    let now = dcp_core::now_secs();
+    let list = verify_snapshot(token, REGISTRY_DID, &key, now).expect("the snapshot verifies");
+    let decision = list.check(TI, "MembershipCredential", now);
+    assert!(!decision.trusted);
+    assert_eq!(decision.chain, vec![TI, TAO]);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn an_empty_admin_token_disables_the_admin_api() {
     let body = json!({"role": "root_tao", "credentialTypes": ["*"], "status": "active"});

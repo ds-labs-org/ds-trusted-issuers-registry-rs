@@ -781,6 +781,27 @@ mod tests {
     }
 
     #[test]
+    fn a_narrowed_accreditor_still_revalidates() {
+        let mut r = three_tier();
+        r.upsert(
+            record(TAO, Role::Tao, &["DataProcessorCredential"], Some(ROOT)),
+            2,
+        )
+        .unwrap();
+        let reloaded = r.clone().revalidated().expect("a state upsert produced");
+        assert_eq!(reloaded, r);
+        assert!(!reloaded.check(TI, "MembershipCredential", 10).trusted);
+        // Writing the out-of-scope dependent again is still refused.
+        assert!(matches!(
+            r.upsert(
+                record(TI, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                3
+            ),
+            Err(RegistryError::AccreditorScope { .. })
+        ));
+    }
+
+    #[test]
     fn write_rules() {
         let mut r = three_tier();
         assert_eq!(
