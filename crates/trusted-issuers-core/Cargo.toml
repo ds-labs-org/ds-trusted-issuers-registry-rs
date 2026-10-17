@@ -21,3 +21,6 @@ x509-cert = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
+# Validates exports against the official ETSI and EBSI JSON schemas in
+# tests/conformance.rs.
+jsonschema = { version = "0.33", default-features = false }
