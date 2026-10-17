@@ -1665,4 +1665,119 @@ mod tests {
         let r: Registry = serde_json::from_value(legacy).unwrap();
         assert!(r.get(ROOT).is_some());
     }
+
+    // OID4VCI names a credential issuer by its Credential Issuer Identifier:
+    // an https URL with a host, an optional port and path, and no query or
+    // fragment. SD-JWT VCs carry it as `iss` and their type as `vct`.
+    const OID4VCI_TI: &str = "https://issuer.example";
+    const OID4VCI_TENANT: &str = "https://issuers.example:8443/tenants/acme";
+    const PID_VCT: &str = "https://credentials.example/identity_credential";
+
+    #[test]
+    fn an_oid4vci_issuer_is_listed_and_checked_next_to_dcp_issuers() {
+        let mut r = three_tier();
+        r.upsert(
+            record(OID4VCI_TI, Role::Ti, &["MembershipCredential"], Some(TAO)),
+            2,
+        )
+        .unwrap();
+        let d = r.check(OID4VCI_TI, "MembershipCredential", 10);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec![OID4VCI_TI, TAO, ROOT]);
+        // The DCP issuer under the same TAO is unaffected.
+        assert!(r.check(TI, "MembershipCredential", 10).trusted);
+        // Scope still applies.
+        assert!(!r.check(OID4VCI_TI, "DataProcessorCredential", 10).trusted);
+    }
+
+    #[test]
+    fn an_oid4vci_party_can_accredit_and_vct_types_are_scoped() {
+        let mut r = three_tier();
+        // A TAO named by URL, accredited by the did:web root, accrediting a
+        // tenant issuer for an SD-JWT VC type.
+        r.upsert(record(OID4VCI_TI, Role::Tao, &[PID_VCT], Some(ROOT)), 2)
+            .unwrap();
+        r.upsert(
+            record(OID4VCI_TENANT, Role::Ti, &[PID_VCT], Some(OID4VCI_TI)),
+            2,
+        )
+        .unwrap();
+        let d = r.check(OID4VCI_TENANT, PID_VCT, 10);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec![OID4VCI_TENANT, OID4VCI_TI, ROOT]);
+        assert_eq!(r.dependents_of(OID4VCI_TI), vec![OID4VCI_TENANT]);
+
+        r.set_status(OID4VCI_TI, Status::Suspended, 3).unwrap();
+        assert!(!r.check(OID4VCI_TENANT, PID_VCT, 10).trusted);
+    }
+
+    #[test]
+    fn well_formed_credential_issuer_identifiers_are_accepted() {
+        for id in [
+            "https://issuer.example",
+            "https://issuer.example:8443",
+            "https://issuer.example/tenant",
+            "https://issuer.example/realms/acme-1/issuer",
+            "https://issuer.example/~alice/a_b.c-d",
+            "https://issuer.example/caf%C3%A9",
+            "https://issuer.example/a%3Ab",
+        ] {
+            let mut r = three_tier();
+            assert_eq!(
+                r.upsert(
+                    record(id, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                    2
+                ),
+                Ok(()),
+                "{id}"
+            );
+            assert!(r.check(id, "MembershipCredential", 10).trusted, "{id}");
+        }
+    }
+
+    #[test]
+    fn urls_that_are_not_credential_issuer_identifiers_are_refused() {
+        for id in [
+            // Not https.
+            "http://issuer.example",
+            "ftp://issuer.example",
+            "issuer.example",
+            "https:issuer.example",
+            "https://",
+            // OID4VCI: no query or fragment.
+            "https://issuer.example?tenant=acme",
+            "https://issuer.example/t?x=1",
+            "https://issuer.example#frag",
+            // No userinfo: who the party is must not hide before an `@`.
+            "https://alice@issuer.example",
+            "https://issuer.example@evil.example",
+            // The host must be a DNS name, as for did:web.
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://issuer_x.example",
+            "https://-issuer.example",
+            "https://issuer%2Eexample",
+            // A port is 1-65535, no leading zero.
+            "https://issuer.example:0",
+            "https://issuer.example:65536",
+            "https://issuer.example:",
+            // Characters a URL parser rewrites or that are not URL syntax.
+            "https://issuer.example/a b",
+            "https://issuer.example/a\\b",
+            "https://issuer.example/caf\u{e9}",
+            "https://issuer.example/%zz",
+            "https://issuer.example/a%2",
+        ] {
+            let mut r = three_tier();
+            assert_eq!(
+                r.upsert(
+                    record(id, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                    2
+                ),
+                Err(RegistryError::InvalidId(id.into())),
+                "{id}"
+            );
+            assert_eq!(r.version, 3, "{id}");
+        }
+    }
 }
