@@ -1095,7 +1095,6 @@ mod tests {
             "did:web:localhost%3A44",
             "did:web:localhost%3A80",
             "did:web:localhost%3A4430",
-            "did:web:example.com:user%2Dx:Alice",
         ] {
             assert!(is_did(valid), "{valid} should be valid");
         }
@@ -1125,6 +1124,53 @@ mod tests {
             "did:web:localhost%3A443:user:Alice",
             // Not DNS host characters.
             "did:web:a_b.example",
+        ] {
+            assert!(!is_did(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn did_web_path_segments_have_one_spelling() {
+        for valid in [
+            "did:web:example.com:user:Alice",
+            "did:web:localhost%3A8443:user:Alice",
+            // Escapes of reserved characters and of `~` (which DID Core's
+            // idchar can only write that way) are not RFC 3986 aliases of a
+            // plain character.
+            "did:web:example.com:user%7Ex",
+            "did:web:example.com:a%2Fb",
+            "did:web:example.com:a%3Ab",
+            // Only a segment that is exactly `.` or `..` is a dot segment.
+            "did:web:example.com:.a",
+            "did:web:example.com:a..b",
+            "did:web:example.com:...",
+        ] {
+            assert!(is_did(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            // The resolver joins path segments with `/` and the url crate
+            // removes dot segments, so each of these fetches the same
+            // document as the DID without it.
+            "did:web:example.com:.",
+            "did:web:example.com:..",
+            "did:web:example.com:user:.",
+            "did:web:example.com:.:alice",
+            "did:web:example.com:bob:..:alice",
+            "did:web:localhost%3A8443:.:alice",
+            // Escaped dots are dot segments too, in either case.
+            "did:web:example.com:%2E",
+            "did:web:example.com:%2e",
+            "did:web:example.com:bob:%2E%2E:alice",
+            "did:web:example.com:bob:%2e%2e:alice",
+            "did:web:example.com:bob:.%2E:alice",
+            "did:web:example.com:bob:%2E.:alice",
+            // An escaped ALPHA, DIGIT, `-`, `.` or `_` is RFC 3986-equivalent
+            // to the plain character.
+            "did:web:example.com:%61lice",
+            "did:web:example.com:%41lice",
+            "did:web:example.com:user%2Dx:Alice",
+            "did:web:example.com:a%5Fb",
+            "did:web:example.com:%30",
         ] {
             assert!(!is_did(invalid), "{invalid} should be invalid");
         }
@@ -1191,6 +1237,41 @@ mod tests {
             );
         }
         assert_eq!(r.issuers.len(), 6);
+    }
+
+    #[test]
+    fn a_party_cannot_be_stored_under_a_second_path_spelling() {
+        let mut r = three_tier();
+        let by_tao = |did: &str| record(did, Role::Ti, &["MembershipCredential"], Some(TAO));
+        r.upsert(by_tao("did:web:host.example:alice"), 2).unwrap();
+        for alias in [
+            "did:web:host.example:.:alice",
+            "did:web:host.example:bob:..:alice",
+            "did:web:host.example:bob:%2E%2E:alice",
+            "did:web:host.example:%61lice",
+            "did:web:host.example:alice:.",
+        ] {
+            assert_eq!(
+                r.upsert(by_tao(alias), 2),
+                Err(RegistryError::InvalidDid(alias.into())),
+                "{alias}"
+            );
+        }
+        assert_eq!(r.issuers.len(), 4);
+    }
+
+    #[test]
+    fn a_stored_path_alias_is_refused_on_load_too() {
+        let mut loose = three_tier();
+        let mut ti = loose.issuers.remove(TI).unwrap();
+        ti.did = "did:web:issuer.example:bob:%2E%2E:alice".into();
+        loose.issuers.insert(ti.did.clone(), ti);
+        assert_eq!(
+            loose.revalidated(),
+            Err(RegistryError::InvalidDid(
+                "did:web:issuer.example:bob:%2E%2E:alice".into()
+            ))
+        );
     }
 
     #[test]
