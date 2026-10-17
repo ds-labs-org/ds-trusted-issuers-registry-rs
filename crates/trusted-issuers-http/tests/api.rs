@@ -1281,3 +1281,63 @@ async fn invalid_or_shared_anchors_are_refused_with_422() {
         assert_eq!(status, want, "{path}: {body}");
     }
 }
+
+#[tokio::test]
+async fn an_issuer_downloads_accreditations_that_verify_offline() {
+    let s = state(Some(TOKEN), None);
+    seed_with_oid4vci(&s).await;
+    let (status, body, content_type) = call(
+        &s,
+        "GET",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}/accreditations"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(content_type.as_deref(), Some("application/json"));
+    let tokens: Vec<String> = serde_json::from_value(body["accreditations"].clone()).unwrap();
+    assert_eq!(tokens.len(), 3);
+
+    // A verifier with only the registry's DID document.
+    let (_, doc, _) = call(&s, "GET", "/.well-known/did.json", None, None).await;
+    let doc = serde_json::from_value(doc).unwrap();
+    let kid = dcp_core::decode_jws_unverified(&tokens[0]).unwrap().1["kid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = find_verifying_key(&doc, &kid).unwrap();
+    let now = dcp_core::now_secs();
+    let chain =
+        trusted_issuers_core::verify_accreditations(&tokens, REGISTRY_DID, &key, now).unwrap();
+    assert!(chain.check(OID4VCI_TI, PID_VCT, now).trusted);
+
+    // Unknown issuer: 404; broken chain: 422.
+    let (status, _, _) = call(
+        &s,
+        "GET",
+        "/v1/issuers/did:web:nobody.example/accreditations",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        "/v1/issuers/did:web:pid-tao.example/status",
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body, _) = call(
+        &s,
+        "GET",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}/accreditations"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
