@@ -15,11 +15,16 @@
 //! accreditors' keys. A verifier therefore needs only the registry's key,
 //! as for the snapshot.
 
-use dcp_core::DcpKeyPair;
+use std::collections::BTreeMap;
+
+use dcp_core::{DcpKeyPair, decode_jws_unverified, verify_jws_signature};
 use p256::ecdsa::VerifyingKey;
+use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::registry::{Registry, TrustDecision};
+use crate::model::{IssuerRecord, Role, Status};
+use crate::registry::{MAX_CHAIN_DEPTH, Registry, TrustDecision, canonical_id};
+use crate::snapshot::sign_with_typ;
 
 /// `typ` of an accreditation JWT.
 pub const ACCREDITATION_TYP: &str = "JWT";
@@ -51,8 +56,100 @@ pub fn issue_accreditations(
     now: u64,
     ttl_secs: u64,
 ) -> Result<Vec<String>, AccreditationError> {
-    let _ = (registry, id, key, now, ttl_secs);
-    Err(AccreditationError::Malformed("not implemented".into()))
+    let id = canonical_id(id);
+    if registry.get(&id).is_none() {
+        return Err(AccreditationError::NotFound(id));
+    }
+    // The chain the trust check walks, refused unless every link is usable
+    // now; "*" asks only whether each link is in scope for something, which
+    // every record is.
+    let mut links: Vec<&IssuerRecord> = Vec::new();
+    let mut cursor = Some(id.clone());
+    while let Some(current) = cursor {
+        let not_accredited = |reason: String| AccreditationError::NotAccredited {
+            id: id.clone(),
+            reason,
+        };
+        if links.len() >= MAX_CHAIN_DEPTH || links.iter().any(|l| l.id == current) {
+            return Err(not_accredited(
+                "the accreditation chain is malformed".into(),
+            ));
+        }
+        let record = registry
+            .get(&current)
+            .ok_or_else(|| not_accredited(format!("'{current}' is not in the registry")))?;
+        if !links.is_empty() && !record.role.can_accredit() {
+            return Err(not_accredited(format!(
+                "'{current}' cannot accredit others"
+            )));
+        }
+        if !record.is_usable_at(now) {
+            return Err(not_accredited(format!(
+                "'{current}' is not active or outside its validity period"
+            )));
+        }
+        cursor = match record.role {
+            Role::RootTao => None,
+            _ => Some(
+                record
+                    .accredited_by
+                    .clone()
+                    .ok_or_else(|| not_accredited(format!("'{current}' has no accreditor")))?,
+            ),
+        };
+        links.push(record);
+    }
+    let exp = links
+        .iter()
+        .filter_map(|l| l.valid_until)
+        .fold(now.saturating_add(ttl_secs), u64::min);
+    Ok(links
+        .iter()
+        .map(|record| {
+            let payload = accreditation_payload(record, &key.own_did, now, exp);
+            sign_with_typ(&payload, key, ACCREDITATION_TYP)
+        })
+        .collect())
+}
+
+/// The EBSI-shaped VC type that says what a link may do.
+fn link_type(role: Role) -> &'static str {
+    match role {
+        Role::RootTao => "VerifiableAuthorisationForTrustChain",
+        Role::Tao => "VerifiableAccreditationToAccredit",
+        Role::Ti => "VerifiableAccreditationToAttest",
+    }
+}
+
+fn accreditation_payload(record: &IssuerRecord, iss: &str, now: u64, exp: u64) -> Value {
+    let mut subject = json!({
+        "id": record.id,
+        "role": record.role,
+        "accreditedFor": [{"types": record.credential_types}],
+    });
+    if let Some(name) = &record.name {
+        subject["name"] = json!(name);
+    }
+    if !record.x509_certificates.is_empty() {
+        subject["x509Certificates"] = json!(record.x509_certificates);
+    }
+    let mut types = vec!["VerifiableCredential", "VerifiableAttestation"];
+    if record.role != Role::RootTao {
+        types.push("VerifiableAccreditation");
+    }
+    types.push(link_type(record.role));
+    let mut vc = json!({
+        "@context": ["https://www.w3.org/2018/credentials/v1"],
+        "type": types,
+        "issuer": iss,
+        "issuanceDate": crate::iso8601_utc(now),
+        "expirationDate": crate::iso8601_utc(exp),
+        "credentialSubject": subject,
+    });
+    if let Some(by) = &record.accredited_by {
+        vc["termsOfUse"] = json!({"id": by, "type": "IssuanceCertificate"});
+    }
+    json!({"iss": iss, "sub": record.id, "iat": now, "nbf": now, "exp": exp, "vc": vc})
 }
 
 /// A verified set of accreditations.
@@ -79,14 +176,90 @@ pub fn verify_accreditations(
     verifying_key: &VerifyingKey,
     now: u64,
 ) -> Result<AccreditationChain, AccreditationError> {
-    let _ = (tokens, expected_iss, verifying_key, now);
-    Err(AccreditationError::Malformed("not implemented".into()))
+    let mut issuers = BTreeMap::new();
+    for token in tokens {
+        let record = verify_one(token, expected_iss, verifying_key, now)?;
+        if issuers.insert(record.id.clone(), record).is_some() {
+            return Err(AccreditationError::Malformed(
+                "two accreditations of the same party".into(),
+            ));
+        }
+    }
+    let registry = Registry {
+        version: 0,
+        issuers,
+    }
+    .revalidated()
+    .map_err(|e| AccreditationError::Malformed(e.to_string()))?;
+    Ok(AccreditationChain { registry })
+}
+
+/// Verifies one accreditation and returns the record it stands for, with
+/// the VC's validity period as the record's.
+fn verify_one(
+    token: &str,
+    expected_iss: &str,
+    verifying_key: &VerifyingKey,
+    now: u64,
+) -> Result<IssuerRecord, AccreditationError> {
+    let malformed = |what: &str| AccreditationError::Malformed(what.to_string());
+    let (_, header, payload) =
+        decode_jws_unverified(token).map_err(AccreditationError::Malformed)?;
+    if header["alg"] != "ES256" || header["typ"] != ACCREDITATION_TYP {
+        return Err(malformed("not an ES256 JWT"));
+    }
+    let iss = payload["iss"].as_str().unwrap_or_default();
+    let kid = header["kid"].as_str().unwrap_or_default();
+    if iss != expected_iss || !kid.starts_with(&format!("{expected_iss}#")) {
+        return Err(AccreditationError::WrongIssuer(iss.to_string()));
+    }
+    verify_jws_signature(token, verifying_key).map_err(AccreditationError::BadSignature)?;
+    let vc = &payload["vc"];
+    let types: Vec<&str> = vc["type"]
+        .as_array()
+        .map(|t| t.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let role = [Role::RootTao, Role::Tao, Role::Ti]
+        .into_iter()
+        .find(|role| types.contains(&link_type(*role)))
+        .ok_or_else(|| malformed("not an accreditation (no accreditation type)"))?;
+    let subject = &vc["credentialSubject"];
+    let id = payload["sub"].as_str().ok_or_else(|| malformed("no sub"))?;
+    if subject["id"] != id || vc["issuer"] != iss {
+        return Err(malformed("sub/credentialSubject.id or iss/issuer disagree"));
+    }
+    let nbf = payload["nbf"].as_u64().ok_or_else(|| malformed("no nbf"))?;
+    let exp = payload["exp"].as_u64().ok_or_else(|| malformed("no exp"))?;
+    if now < nbf || now >= exp {
+        return Err(AccreditationError::NotValidNow { id: id.to_string() });
+    }
+    let strings = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(IssuerRecord {
+        id: id.to_string(),
+        role,
+        name: subject["name"].as_str().map(str::to_string),
+        credential_types: strings(&subject["accreditedFor"][0]["types"]),
+        accredited_by: vc["termsOfUse"]["id"].as_str().map(str::to_string),
+        valid_from: Some(nbf),
+        valid_until: Some(exp),
+        status: Status::Active,
+        x509_certificates: strings(&subject["x509Certificates"]),
+        updated_at: 0,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{IssuerRecord, Role, Status};
 
     const REGISTRY_DID: &str = "did:web:registry.example";
     const ROOT: &str = "did:web:authority.example";

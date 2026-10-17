@@ -66,17 +66,17 @@ pub fn sign_snapshot(registry: &Registry, key: &DcpKeyPair, now: u64, ttl_secs: 
         issuers: registry.list().cloned().collect(),
     };
     let payload = serde_json::to_value(&payload).expect("snapshot payload always serializes");
-    sign_with_typ(&payload, key)
+    sign_with_typ(&payload, key, SNAPSHOT_TYP)
 }
 
 /// Same as `dcp_core::sign_jws`, plus a `typ` header (which `sign_jws`
 /// does not let the caller set).
-fn sign_with_typ(payload: &serde_json::Value, key: &DcpKeyPair) -> String {
+pub(crate) fn sign_with_typ(payload: &serde_json::Value, key: &DcpKeyPair, typ: &str) -> String {
     use dcp_core::b64_encode;
     use p256::ecdsa::Signature;
     use p256::ecdsa::signature::Signer;
 
-    let header = serde_json::json!({"kid": key.own_key_id, "alg": "ES256", "typ": SNAPSHOT_TYP});
+    let header = serde_json::json!({"kid": key.own_key_id, "alg": "ES256", "typ": typ});
     let signing_input = format!(
         "{}.{}",
         b64_encode(header.to_string()),
@@ -277,7 +277,7 @@ mod tests {
             version: 1,
             issuers: registry().list().cloned().collect(),
         };
-        sign_with_typ(&serde_json::to_value(&payload).unwrap(), key)
+        sign_with_typ(&serde_json::to_value(&payload).unwrap(), key, SNAPSHOT_TYP)
     }
 
     #[test]
