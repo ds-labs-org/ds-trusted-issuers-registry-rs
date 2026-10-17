@@ -34,3 +34,28 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  conformance:
+    name: Conformance (ETSI LoTE, EBSI accreditation, x509-limbo)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache conformance downloads
+        uses: actions/cache@v4
+        with:
+          path: target/conformance/downloads
+          key: conformance-${{ hashFiles('conformance/fetch.sh') }}
+
+      - name: Fetch conformance material (pinned, checksummed)
+        run: conformance/fetch.sh
+
+      - name: Run conformance tests
+        run: cargo test -p trusted-issuers-core --test conformance -- --ignored

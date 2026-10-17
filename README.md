@@ -256,13 +256,15 @@ may carry only an `x5c` header. A record lists such roots in
 }
 ```
 
-On write each anchor must decode and parse as an X.509 certificate (at most
-10 per record, 16 KiB each), and no anchor may be listed under two parties,
+On write each anchor must decode and parse as an X.509 CA certificate
+(`basicConstraints` with `cA` set; at most 10 per record, 16 KiB each), and
+no anchor may be listed under two parties,
 so a chain never proves two issuers. `POST /v1/x509/check` (and
 `Registry::check_x5c` / `TrustList::check_x5c` for verifiers holding a
 snapshot) validates the presented chain, leaf first, with `rustls-webpki`
 (signatures, validity, CA and path length constraints, name constraints)
-against each record's anchors, then runs the ordinary accreditation check
+against each record's anchors that are inside their own validity period
+(webpki alone would accept an expired anchor), then runs the ordinary accreditation check
 on the record whose anchor it reached: a valid chain to a suspended or
 out-of-scope party is not trusted. With `eku` (a dotted OID such as the mDL
 document signer's `1.0.18013.5.1.2`) the leaf must carry that extended key
@@ -447,6 +449,35 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Conformance
+
+`crates/trusted-issuers-core/tests/conformance.rs` checks the registry's
+outputs against third-party material that `conformance/fetch.sh` downloads,
+each pinned to a version or commit and checked against its SHA-256, into
+`target/conformance` (`$CONFORMANCE_DIR` overrides). Those tests are
+`#[ignore]`d in the plain `cargo test`; CI runs them in their own job:
+
+```bash
+conformance/fetch.sh
+cargo test -p trusted-issuers-core --test conformance -- --ignored
+```
+
+| Suite | What it checks | Source |
+| --- | --- | --- |
+| ETSI TS 119 602 JSON schema | `GET /v1/lote` validates against the standard's JSON binding (`1960201_json_schema.json`) | taken from the European Commission's EUDI library `eu.europa.ec.eudi:etsi-119602-data-model-jvm` 0.4.0-alpha.4 (Apache-2.0), since forge.etsi.org is often unreachable |
+| EBSI Verifiable Accreditation schema | every link `GET /v1/issuers/{id}/accreditations` signs validates against the official schema, after EBSI's own examples pass the same validator | npm `@cef-ebsi/vcdm1.1-accreditation-schema` and `vcdm1.1-attestation-schema` 2.0.0 (EUPL-1.2) |
+| C2SP x509-limbo | `check_x5c` agrees with 9,754 X.509 path validation cases (BetterTLS, RFC 5280, webpki, CVE and pathological chains), the name check being the harness's | [`limbo.json`](https://github.com/C2SP/x509-limbo) at a pinned commit (Apache-2.0) |
+
+Nothing is vendored: the material is downloaded at test time. The x509-limbo
+test skips the cases that do not apply (CRLs, ML-DSA, a caller-chosen chain
+depth or key usage, and the ones limbo marks pedantic) and lists the 48 it
+knowingly decides otherwise, each with its reason, in `LIMBO_DIVERGENCES`:
+the leaf EKU rule above, rustls-webpki's known leniencies (AKI/SKI,
+extension criticality, a trust anchor's own extensions), and Web PKI rules
+on the subject CN. Any other disagreement fails it, and so does a listed
+case that agrees again. Two cases it found are fixed: an anchor must be a CA
+certificate, and an expired anchor proves nothing.
+
 ## Running it
 
 ```bash
@@ -481,7 +512,8 @@ cargo run -p trusted-issuers-http --bin trusted-issuers-registry -- \
 ## Not done yet
 
 - `ds-identity-hub-rs` checking credentials against the registry
-  (snapshot-backed, by issuer and credential type) is on that repository's
+  (snapshot-backed, by issuer and credential type, behind its
+  `trusted-issuers-registry` Cargo feature) is on that repository's
   `ccr-180333f6-p88qlb` branch, and the governance console's support for
   the new fields and endpoints on `ds-authority-governance-ui`'s; both pin
   this branch until it merges.
