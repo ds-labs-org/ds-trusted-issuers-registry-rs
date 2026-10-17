@@ -82,6 +82,15 @@ impl TrustDecision {
     }
 }
 
+/// Whether [`Registry::validate`] holds a record to its accreditor's scope:
+/// on writes, but not when revalidating stored state (see
+/// [`Registry::revalidated`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Checked,
+    Unchecked,
+}
+
 /// The registry contents. `version` increases by one on every successful
 /// write, so a verifier holding a snapshot can tell whether it is stale.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +127,7 @@ impl Registry {
     /// duplicating.
     pub fn upsert(&mut self, mut record: IssuerRecord, now: u64) -> Result<(), RegistryError> {
         canonicalize(&mut record);
-        self.validate(&record)?;
+        self.validate(&record, Scope::Checked)?;
         record.updated_at = now;
         self.issuers.insert(record.id.clone(), record);
         self.version += 1;
@@ -170,9 +179,14 @@ impl Registry {
             .unwrap_or(0)
     }
 
-    /// Re-applies every write rule to a registry that did not come through
+    /// Re-applies the write rules to a registry that did not come through
     /// [`Registry::upsert`] (a data file loaded from disk, a snapshot),
-    /// inserting accreditors before the records they accredit. Keeps
+    /// inserting accreditors before the records they accredit. The one rule
+    /// left out is the accreditor's scope: narrowing an accreditor is an
+    /// accepted write that leaves its existing dependents out of scope, and
+    /// [`Registry::check`] denies those at read time. Refusing that state
+    /// here would refuse the registry's own data file and every snapshot it
+    /// signs, distrusting every issuer instead of the out-of-scope ones. Keeps
     /// `version` and each record's `updated_at`. Records are brought to
     /// [`canonical_id`] form first, and two that collapse to the same id
     /// are refused as [`RegistryError::Duplicate`] rather than one silently
@@ -201,14 +215,17 @@ impl Registry {
                 // Whatever is left points at a missing accreditor or forms
                 // a cycle; `validate` names the first problem.
                 let first = &rest[0];
-                return Err(out.validate(first).err().unwrap_or_else(|| {
-                    RegistryError::UnknownAccreditor(
-                        first.accredited_by.clone().unwrap_or_default(),
-                    )
-                }));
+                return Err(out
+                    .validate(first, Scope::Unchecked)
+                    .err()
+                    .unwrap_or_else(|| {
+                        RegistryError::UnknownAccreditor(
+                            first.accredited_by.clone().unwrap_or_default(),
+                        )
+                    }));
             }
             for record in ready {
-                out.validate(&record)?;
+                out.validate(&record, Scope::Unchecked)?;
                 out.issuers.insert(record.id.clone(), record);
             }
             pending = rest;
@@ -216,7 +233,7 @@ impl Registry {
         Ok(out)
     }
 
-    fn validate(&self, record: &IssuerRecord) -> Result<(), RegistryError> {
+    fn validate(&self, record: &IssuerRecord, scope: Scope) -> Result<(), RegistryError> {
         if !is_issuer_id(&record.id) {
             return Err(RegistryError::InvalidId(record.id.clone()));
         }
@@ -273,7 +290,7 @@ impl Registry {
                 if let Some(t) = record
                     .credential_types
                     .iter()
-                    .find(|t| !accreditor.covers(t))
+                    .find(|t| scope == Scope::Checked && !accreditor.covers(t))
                 {
                     return Err(RegistryError::AccreditorScope {
                         accreditor: accreditor_did.clone(),
