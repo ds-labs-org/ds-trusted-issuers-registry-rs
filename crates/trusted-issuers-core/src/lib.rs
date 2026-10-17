@@ -3,12 +3,17 @@
 //! accreditation-chain trust check) and [`snapshot`] (the signed,
 //! offline-cacheable trust list).
 
+pub mod accreditation;
 pub mod audit;
 pub mod model;
 pub mod registry;
 pub mod snapshot;
 pub mod x509;
 
+pub use accreditation::{
+    ACCREDITATION_TYP, AccreditationChain, AccreditationError, issue_accreditations,
+    verify_accreditations,
+};
 pub use audit::{
     AuditAction, AuditEntry, AuditError, AuditRecord, GENESIS_HASH, verify_audit_chain,
 };
