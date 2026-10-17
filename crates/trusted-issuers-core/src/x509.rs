@@ -270,12 +270,21 @@ pub(crate) mod tests {
         cn: &str,
         parent: Option<&CertifiedIssuer<'static, KeyPair>>,
     ) -> CertifiedIssuer<'static, KeyPair> {
+        ca_until(cn, parent, (2035, 1, 1))
+    }
+
+    /// Like [`ca`], valid from 2025 until `not_after`.
+    pub(crate) fn ca_until(
+        cn: &str,
+        parent: Option<&CertifiedIssuer<'static, KeyPair>>,
+        not_after: (i32, u8, u8),
+    ) -> CertifiedIssuer<'static, KeyPair> {
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.distinguished_name.push(DnType::CommonName, cn);
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = rcgen::date_time_ymd(2025, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+        params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
         let key = KeyPair::generate().unwrap();
         match parent {
             None => CertifiedIssuer::self_signed(params, key).unwrap(),
@@ -433,6 +442,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_expired_anchor_proves_nothing() {
+        let iaca = ca_until("Expiring IACA", None, (2026, 1, 1));
+        let mut registry = pki().registry;
+        let mut record = registry.get(MDL_ISSUER).unwrap().clone();
+        record.x509_certificates = vec![b64(iaca.der())];
+        registry.upsert(record, 2).unwrap();
+        // The document signer outlives its IACA, which webpki alone allows.
+        let ds = vec![leaf(&iaca, None, (2030, 1, 1))];
+        let before_expiry = 1_760_000_000;
+        let d = registry.check_x5c(&ds, "org.iso.18013.5.1.mDL", before_expiry, None);
+        assert!(d.trusted, "{d:?}");
+        let d = registry.check_x5c(&ds, "org.iso.18013.5.1.mDL", NOW, None);
+        assert!(!d.trusted, "{d:?}");
+        assert!(
+            d.reason
+                .unwrap()
+                .contains("no listed trust anchor is valid")
+        );
+    }
+
+    #[test]
     fn the_accreditation_chain_still_decides() {
         let mut p = pki();
         let ds = leaf(&p.iaca, None, (2030, 1, 1));
@@ -464,6 +494,7 @@ pub(crate) mod tests {
             ("not a certificate", vec![b64(b"hello")]),
             ("too many", vec![other.clone(); MAX_ANCHORS_PER_RECORD + 1]),
             ("too big", vec![b64(&vec![0u8; MAX_ANCHOR_BYTES + 1])]),
+            ("not a CA (a leaf)", vec![leaf(&p.iaca, None, (2030, 1, 1))]),
         ] {
             let mut r = p.registry.clone();
             assert!(
