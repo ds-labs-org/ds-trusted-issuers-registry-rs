@@ -12,6 +12,8 @@
 //! - `GET /v1/issuers/{id}` - one record
 //! - `GET /v1/issuers/{id}/types/{type}` - the accreditation-chain trust
 //!   decision for `id` issuing `type`, right now
+//! - `GET /v1/issuers/{id}/accreditations` - the issuer's accreditation
+//!   chain as registry-signed JWT VCs, verifiable offline
 //! - `POST /v1/x509/check` - `{x5c, credentialType, eku?}`: whether a
 //!   certificate chain proves an issuer trusted for that type, via a listed
 //!   X.509 trust anchor and that party's accreditation chain
@@ -49,8 +51,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 use trusted_issuers_core::{
-    AuditAction, AuditEntry, AuditRecord, IdKind, IssuerRecord, Registry, RegistryError, Role,
-    Status, canonical_id, sign_snapshot,
+    AccreditationError, AuditAction, AuditEntry, AuditRecord, IdKind, IssuerRecord, Registry,
+    RegistryError, Role, Status, canonical_id, issue_accreditations, sign_snapshot,
 };
 
 pub use store::{GraphStore, JsonFileStore, MemoryStore, Store, audit_file, load, persist};
@@ -126,6 +128,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/issuers", get(list_issuers))
         .route("/v1/issuers/{id}", get(get_issuer))
         .route("/v1/issuers/{id}/types/{credential_type}", get(check_trust))
+        .route("/v1/issuers/{id}/accreditations", get(accreditations))
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/x509/check", post(check_x5c))
         .merge(admin)
@@ -369,6 +372,27 @@ async fn check_trust(
         .await
         .check(&id, &credential_type, now_secs());
     Json(decision).into_response()
+}
+
+/// `GET /v1/issuers/{id}/accreditations`: the issuer's accreditation chain
+/// as JWT VCs signed by the registry (see
+/// `trusted_issuers_core::issue_accreditations`), valid for the snapshot
+/// TTL at most. 404 for an unknown issuer, 422 when its chain is broken now.
+async fn accreditations(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let issued = issue_accreditations(
+        &*state.registry.read().await,
+        &id,
+        &state.key,
+        now_secs(),
+        state.snapshot_ttl_secs,
+    );
+    match issued {
+        Ok(tokens) => Json(json!({"accreditations": tokens})).into_response(),
+        Err(e @ AccreditationError::NotFound(_)) => {
+            error(StatusCode::NOT_FOUND, e.to_string()).into_response()
+        }
+        Err(e) => error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+    }
 }
 
 /// The `POST /v1/x509/check` body.
