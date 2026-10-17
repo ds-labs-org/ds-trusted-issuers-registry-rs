@@ -874,21 +874,69 @@ mod tests {
     #[test]
     fn a_lookup_with_an_escaped_host_never_matches_a_stored_host() {
         // Such DIDs can't be stored (is_did refuses them), but lookups take
-        // any string. Canonicalizing one must not land on a listed host.
-        let r = three_tier();
+        // any string. canonical_did never decodes, adds or drops an escape,
+        // so none of them may land on a listed host, in any operation.
+        let mut r = three_tier();
+        let before = r.clone();
         for spelling in [
             "did:web:TAO.example%2F",
             "did:web:tao.example%2Fx",
             "did:web:tao.example%40",
             "did:web:tao.example%3F",
+            "did:web:tao.example%23",
+            // Escapes of unreserved characters decode to the listed host
+            // under RFC 3986, but canonical_did leaves them alone.
+            "did:web:tao%2Eexample",
+            "did:web:%74ao.example",
+            // The port separator without a port.
+            "did:web:tao.example%3A",
+            "did:web:tao.example%3Ax",
         ] {
             assert!(r.get(spelling).is_none(), "{spelling}");
             assert!(
                 !r.check(spelling, "MembershipCredential", 10).trusted,
                 "{spelling}"
             );
+            assert!(r.dependents_of(spelling).is_empty(), "{spelling}");
+            assert!(
+                matches!(
+                    r.set_status(spelling, Status::Revoked, 5),
+                    Err(RegistryError::NotFound(_))
+                ),
+                "{spelling}"
+            );
+            assert!(
+                matches!(r.remove(spelling), Err(RegistryError::NotFound(_))),
+                "{spelling}"
+            );
+            assert_eq!(r, before, "{spelling} changed the registry");
         }
         assert!(r.get("did:web:TAO.example").is_some());
+    }
+
+    #[test]
+    fn upsert_refuses_an_escaped_unreserved_character_in_the_did_web_host() {
+        // `%2E` is `.` and `%74` is `t`, so these would be second spellings
+        // of `new.example` and `tenant.example`. canonical_did can't merge
+        // them (it never decodes), so is_did refuses them on write.
+        let mut r = three_tier();
+        for did in [
+            "did:web:new%2Eexample",
+            "did:web:%74enant.example",
+            "did:web:tenant.example%3A",
+            "did:web:tenant.example%3Ax",
+            "did:web:tenant.example%23",
+        ] {
+            assert_eq!(
+                r.upsert(
+                    record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                    2
+                ),
+                Err(RegistryError::InvalidDid(did.into())),
+                "{did}"
+            );
+        }
+        assert_eq!(r.version, 3);
     }
 
     #[test]
