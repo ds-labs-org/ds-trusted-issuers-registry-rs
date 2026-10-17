@@ -21,7 +21,7 @@ pub const MAX_CHAIN_DEPTH: usize = 8;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
-    #[error("'{0}' is not a DID")]
+    #[error("'{0}' is neither a DID nor an OID4VCI credential issuer identifier")]
     InvalidId(String),
     #[error("credentialTypes must list at least one non-empty type")]
     NoCredentialTypes,
@@ -211,7 +211,7 @@ impl Registry {
     }
 
     fn validate(&self, record: &IssuerRecord) -> Result<(), RegistryError> {
-        if !is_did(&record.id) {
+        if !is_issuer_id(&record.id) {
             return Err(RegistryError::InvalidId(record.id.clone()));
         }
         if record.credential_types.is_empty()
@@ -466,6 +466,75 @@ fn is_did(s: &str) -> bool {
                 && path != [".well-known"]
                 && path.iter().all(|segment| is_did_web_path_segment(segment))
         })
+}
+
+/// Whether `s` may name a party: a DID ([`is_did`]), as DCP issuers are
+/// named, or an OID4VCI Credential Issuer Identifier
+/// ([`is_credential_issuer_id`]).
+fn is_issuer_id(s: &str) -> bool {
+    is_did(s) || is_credential_issuer_id(s)
+}
+
+/// Whether `s` is an OID4VCI Credential Issuer Identifier: "a case sensitive
+/// URL using the https scheme that contains scheme, host and, optionally,
+/// port number and path components, but no query or fragment components"
+/// (OpenID for Verifiable Credential Issuance 1.0, section 12.2.1).
+///
+/// The host follows the did:web rules ([`is_dns_name`]): no IP address and
+/// no userinfo, so the party is always named by a DNS name. The port is an
+/// [`is_port`]. Path segments are made of unreserved characters (letters,
+/// digits, `-`, `.`, `_`, `~`) and percent-escapes of anything else, which
+/// leaves out what a URL parser rewrites (spaces, `\`, raw non-ASCII).
+pub fn is_credential_issuer_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("https://") else {
+        return false;
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    is_dns_name(host)
+        && port.is_none_or(is_port)
+        && path
+            .strip_prefix('/')
+            .is_none_or(|path| path.split('/').all(is_url_path_segment))
+}
+
+/// Whether `segment` is one segment of a credential issuer identifier's
+/// path: unreserved characters and well-formed percent-escapes only.
+fn is_url_path_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if escaped_byte(&bytes[i..]).is_none() {
+                    return false;
+                }
+                i += 3;
+            }
+            c if is_unreserved(c) => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The byte a `%xx` escape at the start of `bytes` stands for, or `None`
+/// when `bytes` does not start with a well-formed escape.
+fn escaped_byte(bytes: &[u8]) -> Option<u8> {
+    match bytes {
+        [b'%', hi, lo, ..] if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit() => {
+            u8::from_str_radix(std::str::from_utf8(&[*hi, *lo]).ok()?, 16).ok()
+        }
+        _ => None,
+    }
+}
+
+/// RFC 3986 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~".
+fn is_unreserved(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~')
 }
 
 /// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
