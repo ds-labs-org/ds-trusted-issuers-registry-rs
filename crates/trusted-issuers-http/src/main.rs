@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use contreforts_core::{ContrefortsConnector, EntityKind};
 use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
+use trusted_issuers_contreforts::{ISSUER_RECORD_KIND, RegistryGraphConnector};
 use trusted_issuers_core::{is_did_web_port, is_dns_name};
-use trusted_issuers_http::{AppState, JsonFileStore, MemoryStore, Store, router};
+use trusted_issuers_http::{AppState, GraphStore, JsonFileStore, MemoryStore, Store, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
 /// this dataspace.
@@ -31,15 +33,28 @@ struct Cli {
     #[arg(long)]
     signing_key_file: Option<PathBuf>,
 
-    /// JSON file the registry is loaded from and saved to after each write.
-    /// Without it the registry lives in memory only.
-    #[arg(long)]
+    /// JSON file the registry is loaded from and saved to after each write,
+    /// with its audit log next to it (`<file>.audit.jsonl`). Without it (or
+    /// `--graph-dir`) the registry lives in memory only.
+    #[arg(long, conflicts_with = "graph_dir")]
     data_file: Option<PathBuf>,
+
+    /// Directory of the registry graph: records and audit log as RDF in an
+    /// on-disk Oxigraph store, reachable through Contreforts' connector
+    /// interface (created if missing).
+    #[arg(long)]
+    graph_dir: Option<PathBuf>,
+
+    /// Move the registry in this JSON data file into `--graph-dir`, which
+    /// must not hold a registry yet. A one-time migration from
+    /// `--data-file`; its audit log is not carried over.
+    #[arg(long, requires = "graph_dir")]
+    import_data_file: Option<PathBuf>,
 
     /// Start with an empty registry when `--data-file` doesn't exist yet.
     /// Without it a missing file is a startup error, so an unmounted volume
     /// can't silently serve an empty list.
-    #[arg(long)]
+    #[arg(long, requires = "data_file")]
     create_data_file: bool,
 
     /// Bearer token for the admin (write) API. Without it the admin API is
@@ -136,13 +151,29 @@ async fn main() -> Result<(), String> {
         }
     };
 
-    let (store, registry): (Arc<dyn Store>, trusted_issuers_core::Registry) = match &cli.data_file {
-        Some(path) => {
-            let (store, registry) = JsonFileStore::open(path, cli.create_data_file)?;
-            (Arc::new(store), registry)
-        }
-        None => (Arc::new(MemoryStore::new()), Default::default()),
-    };
+    let (store, registry): (Arc<dyn Store>, trusted_issuers_core::Registry) =
+        match (&cli.graph_dir, &cli.data_file) {
+            (Some(dir), _) => {
+                let (store, registry) = GraphStore::open(dir, cli.import_data_file.as_deref())?;
+                // Proves the Contreforts round trip over the graph the admin
+                // API writes into, as ds-identity-hub-rs does at startup.
+                let records = RegistryGraphConnector::new(store.graph())
+                    .pull(EntityKind::new(ISSUER_RECORD_KIND), None)
+                    .await
+                    .map_err(|e| format!("contreforts round trip: {e}"))?;
+                tracing::info!(
+                    graph = %dir.display(),
+                    records = records.len(),
+                    "registry graph open, reachable through the Contreforts connector"
+                );
+                (Arc::new(store), registry)
+            }
+            (None, Some(path)) => {
+                let (store, registry) = JsonFileStore::open(path, cli.create_data_file)?;
+                (Arc::new(store), registry)
+            }
+            (None, None) => (Arc::new(MemoryStore::new()), Default::default()),
+        };
     tracing::info!(
         did = %key.own_did,
         issuers = registry.issuers.len(),

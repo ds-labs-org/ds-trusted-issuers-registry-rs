@@ -200,25 +200,37 @@ impl Store for JsonFileStore {
     }
 }
 
-/// The registry graph (see `trusted_issuers_graph`).
+/// The registry graph (see `trusted_issuers_graph`): records and audit log
+/// as RDF in an on-disk Oxigraph store, each commit one transaction.
 pub struct GraphStore {
     graph: std::sync::Arc<trusted_issuers_graph::RegistryGraph>,
+    /// The audit log's latest entry, so chaining a write needs no query.
+    head: Mutex<Option<AuditEntry>>,
 }
 
 impl GraphStore {
     /// Opens the graph in directory `dir` (created if missing) and returns
-    /// it with the registry it holds. With `import`, a JSON data file is
-    /// first moved into a graph that holds no registry yet.
+    /// it with the registry it holds; a broken audit chain is an error.
+    /// With `import`, the registry in that JSON data file is first moved
+    /// into the graph, which must not hold a registry yet: a one-time
+    /// migration from [`JsonFileStore`] (its audit log is not imported).
     pub fn open(dir: &FsPath, import: Option<&FsPath>) -> Result<(Self, Registry), String> {
-        let _ = (dir, import);
+        let err = |e: &dyn std::fmt::Display| format!("{}: {e}", dir.display());
+        let graph = trusted_issuers_graph::RegistryGraph::open(dir).map_err(|e| err(&e))?;
+        if let Some(file) = import {
+            let registry = load(file, false)?;
+            graph
+                .import(&registry)
+                .map_err(|e| err(&format!("importing {}: {e}", file.display())))?;
+        }
+        let registry = graph.load().map_err(|e| err(&e))?;
+        let head = graph.audit().map_err(|e| err(&e))?.pop();
         Ok((
             Self {
-                graph: std::sync::Arc::new(
-                    trusted_issuers_graph::RegistryGraph::open_in_memory()
-                        .map_err(|e| e.to_string())?,
-                ),
+                graph: std::sync::Arc::new(graph),
+                head: Mutex::new(head),
             },
-            Registry::default(),
+            registry,
         ))
     }
 
@@ -229,21 +241,27 @@ impl GraphStore {
 }
 
 impl Store for GraphStore {
-    fn commit(&self, _registry: &Registry, _entry: &AuditEntry) -> std::io::Result<()> {
+    fn commit(&self, registry: &Registry, entry: &AuditEntry) -> std::io::Result<()> {
+        let mut head = lock(&self.head);
+        self.graph
+            .commit(registry, entry)
+            .map_err(std::io::Error::other)?;
+        *head = Some(entry.clone());
         Ok(())
     }
 
     fn audit_head(&self) -> Option<AuditEntry> {
-        None
+        lock(&self.head).clone()
     }
 
     fn audit_page(
         &self,
-        _after: u64,
-        _limit: usize,
-        _id: Option<&str>,
+        after: u64,
+        limit: usize,
+        id: Option<&str>,
     ) -> std::io::Result<Vec<AuditEntry>> {
-        Ok(Vec::new())
+        let entries = self.graph.audit().map_err(std::io::Error::other)?;
+        Ok(page(&entries, after, limit, id))
     }
 }
 
