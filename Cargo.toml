@@ -50,6 +50,8 @@ base64 = "0.22"
 # Reads a leaf certificate's extended key usages (webpki does not expose
 # them); shares der/const-oid with the p256 stack.
 x509-cert = { version = "0.2", default-features = false }
+# Test PKIs (CA, intermediate, leaves) for the X.509 trust anchor tests.
+rcgen = "0.14"
 # SHA-256 for the audit log's hash chain; the same 0.10 line p256 uses.
 sha2 = "0.10"
 

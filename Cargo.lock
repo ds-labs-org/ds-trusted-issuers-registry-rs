@@ -2653,7 +2653,9 @@ dependencies = [
 name = "trusted-issuers-graph"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "oxigraph",
+ "rcgen",
  "serde",
  "serde_json",
  "tempfile",
@@ -2666,11 +2668,13 @@ name = "trusted-issuers-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "clap",
  "contreforts-core",
  "ds-dcp-core-rs",
  "http-body-util",
  "p256",
+ "rcgen",
  "serde",
  "serde_json",
  "tempfile",

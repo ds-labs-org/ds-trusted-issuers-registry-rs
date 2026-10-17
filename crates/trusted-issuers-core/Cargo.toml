@@ -20,4 +20,4 @@ base64 = { workspace = true }
 x509-cert = { workspace = true }
 
 [dev-dependencies]
-rcgen = "0.14"
+rcgen = { workspace = true }

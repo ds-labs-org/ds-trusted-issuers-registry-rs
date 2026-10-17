@@ -1157,3 +1157,127 @@ async fn a_json_data_file_is_imported_into_an_empty_graph_once() {
     let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
     assert_eq!(body["total"], 3);
 }
+
+mod pki {
+    use base64::Engine;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
+        IsCa, KeyPair, KeyUsagePurpose,
+    };
+
+    pub fn b64(der: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(der)
+    }
+
+    pub fn iaca() -> CertifiedIssuer<'static, KeyPair> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Example IACA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
+    }
+
+    /// An mDL document signer certificate issued by `iaca`.
+    pub fn document_signer(iaca: &CertifiedIssuer<'static, KeyPair>) -> String {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Document Signer");
+        params.extended_key_usages =
+            vec![ExtendedKeyUsagePurpose::Other(vec![1, 0, 18013, 5, 1, 2])];
+        b64(params
+            .signed_by(&KeyPair::generate().unwrap(), iaca)
+            .unwrap()
+            .der())
+    }
+}
+
+const MDL_ISSUER_PATH: &str = "https:%2F%2Fmdl.example";
+const MDL: &str = "org.iso.18013.5.1.mDL";
+
+#[tokio::test]
+async fn x5c_chains_are_checked_against_listed_trust_anchors() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    let iaca = pki::iaca();
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{MDL_ISSUER_PATH}"),
+        Some(TOKEN),
+        Some(json!({
+            "role": "ti", "name": "Example mDL issuing authority",
+            "credentialTypes": [MDL], "accreditedBy": ROOT, "status": "active",
+            "x509Certificates": [pki::b64(iaca.der())]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["x509Certificates"][0], pki::b64(iaca.der()));
+
+    let ds = pki::document_signer(&iaca);
+    let (status, body, _) = call(
+        &s,
+        "POST",
+        "/v1/x509/check",
+        None,
+        Some(json!({"x5c": [ds], "credentialType": MDL, "eku": "1.0.18013.5.1.2"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["trusted"], true, "{body}");
+    assert_eq!(body["chain"], json!(["https://mdl.example", ROOT]));
+
+    // Someone else's CA.
+    let other = pki::document_signer(&pki::iaca());
+    let (_, body, _) = call(
+        &s,
+        "POST",
+        "/v1/x509/check",
+        None,
+        Some(json!({"x5c": [other], "credentialType": MDL})),
+    )
+    .await;
+    assert_eq!(body["trusted"], false, "{body}");
+
+    // Bodies are strict.
+    for bad in [
+        json!({"credentialType": MDL}),
+        json!({"x5c": [], "credentialType": MDL, "extra": 1}),
+    ] {
+        let (status, _, _) = call(&s, "POST", "/v1/x509/check", None, Some(bad.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_or_shared_anchors_are_refused_with_422() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    let iaca = pki::b64(pki::iaca().der());
+    for (path, anchors) in [
+        ("https:%2F%2Fa.example", json!(["not base64!"])),
+        ("https:%2F%2Fb.example", json!([iaca.clone()])),
+        ("https:%2F%2Fc.example", json!([iaca.clone()])),
+    ] {
+        let (status, body, _) = call(
+            &s,
+            "PUT",
+            &format!("/v1/issuers/{path}"),
+            Some(TOKEN),
+            Some(json!({
+                "role": "ti", "credentialTypes": ["MembershipCredential"],
+                "accreditedBy": TAO, "status": "active", "x509Certificates": anchors
+            })),
+        )
+        .await;
+        let want = if path.contains("b.example") {
+            StatusCode::CREATED
+        } else {
+            StatusCode::UNPROCESSABLE_ENTITY
+        };
+        assert_eq!(status, want, "{path}: {body}");
+    }
+}

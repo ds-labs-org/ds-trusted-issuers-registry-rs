@@ -605,6 +605,20 @@ mod tests {
         }
     }
 
+    /// A self-signed CA certificate, base64 DER.
+    fn self_signed_ca(cn: &str) -> String {
+        use base64::Engine;
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(cert.der())
+    }
+
     /// Applies `upsert` and returns the audit entry a real write would.
     fn write(
         registry: &mut Registry,
@@ -653,6 +667,7 @@ mod tests {
             Some(TAO),
         );
         ti.status = Status::Suspended;
+        ti.x509_certificates = vec![self_signed_ca("IACA A"), self_signed_ca("IACA B")];
         for record in [root, tao, ti] {
             let entry = write(&mut registry, log.last(), record);
             graph.commit(&registry, &entry).unwrap();

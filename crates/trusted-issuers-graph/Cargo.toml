@@ -20,4 +20,6 @@ thiserror = { workspace = true }
 # updating the lock.
 
 [dev-dependencies]
+rcgen = { workspace = true }
+base64 = { workspace = true }
 tempfile = "3"
