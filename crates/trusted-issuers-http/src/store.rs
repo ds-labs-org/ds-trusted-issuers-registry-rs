@@ -64,6 +64,14 @@ impl Store for MemoryStore {
     }
 }
 
+/// Where a [`JsonFileStore`] keeps the audit log of `data_file`: next to it,
+/// `<data file>.audit.jsonl`.
+pub fn audit_file(data_file: &FsPath) -> PathBuf {
+    let mut name = data_file.as_os_str().to_owned();
+    name.push(".audit.jsonl");
+    PathBuf::from(name)
+}
+
 /// The registry as one JSON file (see [`persist`]).
 pub struct JsonFileStore {
     path: PathBuf,

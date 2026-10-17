@@ -831,3 +831,257 @@ async fn oid4vci_issuers_survive_the_snapshot_and_the_data_file() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn audit_entries(body: &Value) -> Vec<trusted_issuers_core::AuditEntry> {
+    serde_json::from_value(body["entries"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn every_write_is_audited_in_a_verifiable_chain() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{TI_PATH}/status"),
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = call(
+        &s,
+        "DELETE",
+        &format!("/v1/issuers/{TI_PATH}"),
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body, _) = call(&s, "GET", "/v1/admin/audit", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = audit_entries(&body);
+    use trusted_issuers_core::AuditAction::*;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| (e.seq, e.action, e.id.as_str(), e.version))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Put, ROOT, 1),
+            (2, Put, TAO, 2),
+            (3, Put, TI, 3),
+            (4, Status, TI, 4),
+            (5, Delete, TI, 5),
+        ]
+    );
+    assert!(entries.iter().all(|e| e.actor == "admin"));
+    assert!(entries[0].before.is_none());
+    assert_eq!(entries[0].after.as_ref().unwrap().id, ROOT);
+    assert_eq!(
+        entries[3].before.as_ref().unwrap().status,
+        trusted_issuers_core::Status::Active
+    );
+    assert_eq!(
+        entries[3].after.as_ref().unwrap().status,
+        trusted_issuers_core::Status::Suspended
+    );
+    assert!(entries[4].after.is_none());
+    assert_eq!(trusted_issuers_core::verify_audit_chain(&entries), Ok(()));
+    assert_eq!(body["head"]["seq"], 5);
+    assert_eq!(body["head"]["hash"], entries[4].hash.as_str());
+}
+
+#[tokio::test]
+async fn failed_writes_leave_no_audit_entry() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    // A rule violation and an unknown record.
+    let (status, _, _) = call(
+        &s,
+        "PUT",
+        "/v1/issuers/did:web:x.example",
+        Some(TOKEN),
+        Some(json!({"role": "ti", "credentialTypes": ["Other"], "accreditedBy": TAO, "status": "active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _, _) = call(
+        &s,
+        "DELETE",
+        "/v1/issuers/did:web:nobody.example",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, body, _) = call(&s, "GET", "/v1/admin/audit", Some(TOKEN), None).await;
+    assert_eq!(audit_entries(&body).len(), 3, "{body}");
+}
+
+#[tokio::test]
+async fn the_audit_log_is_admin_only() {
+    let s = state(Some(TOKEN), None);
+    let (status, _, _) = call(&s, "GET", "/v1/admin/audit", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = call(&s, "GET", "/v1/admin/audit", Some("wrong"), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_audit_log_pages_and_filters_by_issuer() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{TI_PATH}/status"),
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        "/v1/admin/audit?after=1&limit=2",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let seqs: Vec<u64> = audit_entries(&body).iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![2, 3], "{body}");
+    // The head is the whole log's, whatever the page.
+    assert_eq!(body["head"]["seq"], 4);
+
+    // `id` is a query value, so its own % is sent as %25; any spelling of
+    // the DID matches.
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        "/v1/admin/audit?id=did:web:ISSUER.example%253a8443",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    let seqs: Vec<u64> = audit_entries(&body).iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![3, 4], "{body}");
+
+    let (status, _, _) = call(&s, "GET", "/v1/admin/audit?limit=0", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = call(&s, "GET", "/v1/admin/audit?limit=1001", Some(TOKEN), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn the_audit_actor_comes_from_the_configured_gateway_header() {
+    let s = Arc::new(
+        AppState::new(
+            Default::default(),
+            DcpKeyPair::generate(REGISTRY_DID.into()),
+            Some(TOKEN.into()),
+            Arc::new(MemoryStore::new()),
+            600,
+        )
+        .with_audit_actor_header("x-forwarded-user"),
+    );
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/v1/issuers/{ROOT}"))
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header("X-Forwarded-User", "alice@authority.example")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"role": "root_tao", "credentialTypes": ["*"], "status": "active"}).to_string(),
+        ))
+        .unwrap();
+    let resp = router(s.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    // Without the header the actor falls back to "admin".
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{ROOT}/status"),
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body, _) = call(&s, "GET", "/v1/admin/audit", Some(TOKEN), None).await;
+    let actors: Vec<String> = audit_entries(&body).into_iter().map(|e| e.actor).collect();
+    assert_eq!(actors, vec!["alice@authority.example", "admin"]);
+}
+
+#[tokio::test]
+async fn the_audit_log_survives_a_restart_and_tampering_is_refused() {
+    let dir = std::env::temp_dir().join(format!("tir-audit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("registry.json");
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(trusted_issuers_http::audit_file(&file));
+
+    let s = state(Some(TOKEN), Some(file.clone()));
+    seed(&s).await;
+    drop(s);
+
+    // Restart: the log is back and the next write chains onto it.
+    let s = state(Some(TOKEN), Some(file.clone()));
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{TI_PATH}/status"),
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body, _) = call(&s, "GET", "/v1/admin/audit", Some(TOKEN), None).await;
+    let entries = audit_entries(&body);
+    assert_eq!(entries.len(), 4, "{body}");
+    assert_eq!(trusted_issuers_core::verify_audit_chain(&entries), Ok(()));
+    drop(s);
+
+    // A crash after the audit entry was written but before the registry
+    // file was replaced leaves one entry ahead of the registry: it is
+    // dropped on open, since that write never happened.
+    let audit = trusted_issuers_http::audit_file(&file);
+    let ahead = trusted_issuers_core::AuditEntry::next(
+        entries.last(),
+        trusted_issuers_core::AuditRecord {
+            at: 1,
+            actor: "admin".into(),
+            action: trusted_issuers_core::AuditAction::Delete,
+            id: TI.into(),
+            before: entries.last().unwrap().after.clone(),
+            after: None,
+            version: 5,
+        },
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&audit)
+        .unwrap();
+    use std::io::Write;
+    writeln!(f, "{}", serde_json::to_string(&ahead).unwrap()).unwrap();
+    drop(f);
+    let (store, registry) = JsonFileStore::open(&file, false).unwrap();
+    assert_eq!(registry.version, 4);
+    assert_eq!(store.audit_head().unwrap().seq, 4);
+
+    // Editing a past entry makes the store refuse to open.
+    let text = std::fs::read_to_string(&audit).unwrap();
+    std::fs::write(
+        &audit,
+        text.replacen("\"actor\":\"admin\"", "\"actor\":\"mallory\"", 1),
+    )
+    .unwrap();
+    let err = JsonFileStore::open(&file, false)
+        .err()
+        .expect("tampered log");
+    assert!(err.contains("audit"), "{err}");
+
+    std::fs::remove_dir_all(dir).unwrap();
+}

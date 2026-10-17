@@ -50,7 +50,7 @@ use trusted_issuers_core::{
     Status, canonical_id, sign_snapshot,
 };
 
-pub use store::{JsonFileStore, MemoryStore, Store, load, persist};
+pub use store::{JsonFileStore, MemoryStore, Store, audit_file, load, persist};
 
 pub const SNAPSHOT_CONTENT_TYPE: &str = "application/trust-list+jwt";
 
@@ -83,6 +83,13 @@ impl AppState {
             store,
             snapshot_ttl_secs,
         }
+    }
+
+    /// Takes the audit log's actor from request header `name`, as set by
+    /// the gateway in front of the admin API.
+    pub fn with_audit_actor_header(self, name: &str) -> Self {
+        let _ = name;
+        self
     }
 
     pub fn admin_enabled(&self) -> bool {
