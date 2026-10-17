@@ -449,11 +449,15 @@ fn uppercase_escapes(s: &str) -> String {
 /// is not.
 ///
 /// `did:web` is stricter: its first segment is a DNS host, optionally
-/// followed by `%3A` and a port (see [`is_did_web_host`]).
+/// followed by `%3A` and a port (see [`is_did_web_host`]), and the others
+/// are path segments with one spelling each (see
+/// [`is_did_web_path_segment`]).
 fn is_did(s: &str) -> bool {
     is_did_core(s)
-        && s.strip_prefix("did:web:")
-            .is_none_or(|rest| is_did_web_host(rest.split_once(':').map_or(rest, |(host, _)| host)))
+        && s.strip_prefix("did:web:").is_none_or(|rest| {
+            let mut segments = rest.split(':');
+            segments.next().is_some_and(is_did_web_host) && segments.all(is_did_web_path_segment)
+        })
 }
 
 /// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
@@ -475,6 +479,35 @@ fn is_did_web_host(segment: &str) -> bool {
             p.get(..3)
                 .is_some_and(|sep| sep.eq_ignore_ascii_case("%3A"))
                 && is_port(&p[3..])
+        })
+}
+
+/// Whether a `did:web` path segment names its directory one way only.
+///
+/// The resolver joins the path segments with `/` into a URL, and URL parsing
+/// removes the dot segments `.` and `..` and treats an escaped unreserved
+/// character as the character itself (RFC 3986 section 6.2.2.2). So
+/// `did:web:host:.:alice`, `did:web:host:bob:..:alice`,
+/// `did:web:host:bob:%2E%2E:alice` and `did:web:host:%61lice` all fetch the
+/// document of `did:web:host:alice`, and [`canonical_did`] doesn't decode
+/// escapes to merge them. Such a DID is refused instead of stored as a
+/// second record for the same party, or one that reads as another tenant.
+///
+/// A segment is refused when it is `.` or `..` or holds an escape of an
+/// ALPHA, DIGIT, `-`, `.` or `_`. Escapes of reserved characters (`%2F`,
+/// `%40`, ...) and of `~` stay legal: DID Core's idchar has no `~`, so
+/// `%7E` is the only way to write it. Assumes [`is_did_core`] already
+/// accepted the escapes as well formed.
+fn is_did_web_path_segment(segment: &str) -> bool {
+    !matches!(segment, "." | "..")
+        && !segment.as_bytes().windows(3).any(|w| {
+            // A `%` and the two hex digits after it.
+            w[0] == b'%'
+                && std::str::from_utf8(&w[1..])
+                    .ok()
+                    .filter(|hex| hex.bytes().all(|c| c.is_ascii_hexdigit()))
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                    .is_some_and(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_'))
         })
 }
 
