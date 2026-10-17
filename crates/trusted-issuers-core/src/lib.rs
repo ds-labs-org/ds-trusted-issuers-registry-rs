@@ -5,6 +5,7 @@
 
 pub mod accreditation;
 pub mod audit;
+pub mod lote;
 pub mod model;
 pub mod registry;
 pub mod snapshot;
@@ -16,6 +17,10 @@ pub use accreditation::{
 };
 pub use audit::{
     AuditAction, AuditEntry, AuditError, AuditRecord, GENESIS_HASH, verify_audit_chain,
+};
+pub use lote::{
+    DEFAULT_LOTE_TYPE, LOTE_TYP, LOTE_VERSION, LoteOptions, SERVICE_TYPE_ACCREDITATION,
+    SERVICE_TYPE_ISSUANCE, build_lote,
 };
 pub use model::{ANY_CREDENTIAL_TYPE, IdKind, IssuerRecord, Role, Status};
 pub use registry::{
