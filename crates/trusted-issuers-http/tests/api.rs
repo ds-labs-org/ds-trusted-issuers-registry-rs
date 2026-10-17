@@ -95,7 +95,7 @@ async fn authority_builds_a_chain_and_verifiers_read_it() {
 
     let (status, body, _) = call(&s, "GET", &format!("/v1/issuers/{TI_PATH}"), None, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["did"], TI);
+    assert_eq!(body["id"], TI);
     assert!(body["updatedAt"].as_u64().unwrap() > 0);
 
     let (_, body, _) = call(
@@ -446,7 +446,7 @@ async fn list_filters_by_role_and_status() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| r["did"].as_str().unwrap().to_string())
+            .map(|r| r["id"].as_str().unwrap().to_string())
             .collect();
         dids.sort();
         dids
@@ -502,14 +502,14 @@ async fn dids_are_canonicalized_on_write_and_lookup() {
         "/v1/issuers/did:web:Issuer.example%253a8443",
         Some(TOKEN),
         Some(json!({
-            "did": TI,
+            "id": TI,
             "role": "ti", "credentialTypes": ["MembershipCredential"],
             "accreditedBy": "did:web:TAO.example", "status": "active"
         })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["did"], TI);
+    assert_eq!(body["id"], TI);
     assert_eq!(body["accreditedBy"], TAO);
 
     let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
@@ -524,7 +524,7 @@ async fn dids_are_canonicalized_on_write_and_lookup() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["did"], TI);
+    assert_eq!(body["id"], TI);
 
     let (_, body, _) = call(
         &s,

@@ -99,7 +99,7 @@ pub struct TrustList {
 }
 
 impl TrustList {
-    pub fn check(&self, did: &str, credential_type: &str, now: u64) -> TrustDecision {
+    pub fn check(&self, id: &str, credential_type: &str, now: u64) -> TrustDecision {
         if now >= self.exp {
             return TrustDecision {
                 trusted: false,
@@ -110,7 +110,7 @@ impl TrustList {
                 )),
             };
         }
-        self.registry.check(did, credential_type, now)
+        self.registry.check(id, credential_type, now)
     }
 
     pub fn registry(&self) -> &Registry {
@@ -162,7 +162,7 @@ pub fn verify_snapshot(
     }
     let mut issuers = std::collections::BTreeMap::new();
     for record in payload.issuers {
-        let did = record.did.clone();
+        let did = record.id.clone();
         if issuers.insert(did.clone(), record).is_some() {
             return Err(SnapshotError::Malformed(format!(
                 "'{did}' is listed more than once"
@@ -205,7 +205,7 @@ mod tests {
         let mut r = Registry::default();
         r.upsert(
             IssuerRecord {
-                did: "did:web:authority.example".into(),
+                id: "did:web:authority.example".into(),
                 role: Role::RootTao,
                 name: Some("Authority".into()),
                 credential_types: vec!["*".into()],

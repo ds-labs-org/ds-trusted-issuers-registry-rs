@@ -8,9 +8,9 @@
 //! - `GET /v1/issuers[?credentialType=T&role=R&status=S]` - every record,
 //!   optionally only those scoped for `T`, in role `R`, with status `S` (a listing, not an allow-list: suspended or
 //!   expired records are included - use the trust check for decisions)
-//! - `GET /v1/issuers/{did}` - one record
-//! - `GET /v1/issuers/{did}/types/{type}` - the accreditation-chain trust
-//!   decision for `did` issuing `type`, right now
+//! - `GET /v1/issuers/{id}` - one record
+//! - `GET /v1/issuers/{id}/types/{type}` - the accreditation-chain trust
+//!   decision for `id` issuing `type`, right now
 //! - `GET /v1/snapshot` - the whole registry as a signed compact JWS
 //!   (`application/trust-list+jwt`)
 //!
@@ -21,9 +21,9 @@
 //!
 //! - `GET /v1/admin` - `204` when the presented token would be accepted, so
 //!   a console can show itself read-only before offering writes
-//! - `PUT /v1/issuers/{did}` - create or replace a record
-//! - `PATCH /v1/issuers/{did}/status` - `{"status": "suspended"}` etc.
-//! - `DELETE /v1/issuers/{did}`
+//! - `PUT /v1/issuers/{id}` - create or replace a record
+//! - `PATCH /v1/issuers/{id}/status` - `{"status": "suspended"}` etc.
+//! - `DELETE /v1/issuers/{id}`
 //!
 //! DIDs go in the path percent-encoded as one segment, so a `did:web` with a
 //! port (`did:web:host%3A8080`) is sent as `did:web:host%253A8080`.
@@ -88,19 +88,16 @@ impl AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     let admin = Router::new()
-        .route("/v1/issuers/{did}", put(put_issuer).delete(delete_issuer))
-        .route("/v1/issuers/{did}/status", patch(patch_status))
+        .route("/v1/issuers/{id}", put(put_issuer).delete(delete_issuer))
+        .route("/v1/issuers/{id}/status", patch(patch_status))
         .route("/v1/admin", get(|| async { StatusCode::NO_CONTENT }))
         .route_layer(from_fn_with_state(state.clone(), require_admin));
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/.well-known/did.json", get(did_document))
         .route("/v1/issuers", get(list_issuers))
-        .route("/v1/issuers/{did}", get(get_issuer))
-        .route(
-            "/v1/issuers/{did}/types/{credential_type}",
-            get(check_trust),
-        )
+        .route("/v1/issuers/{id}", get(get_issuer))
+        .route("/v1/issuers/{id}/types/{credential_type}", get(check_trust))
         .route("/v1/snapshot", get(snapshot))
         .merge(admin)
         .with_state(state)
@@ -279,12 +276,12 @@ async fn list_issuers(
     Json(json!({"version": registry.version, "total": items.len(), "items": items}))
 }
 
-async fn get_issuer(State(state): State<Arc<AppState>>, Path(did): Path<String>) -> Response {
-    match state.registry.read().await.get(&did) {
+async fn get_issuer(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.registry.read().await.get(&id) {
         Some(record) => Json(record).into_response(),
         None => error(
             StatusCode::NOT_FOUND,
-            format!("'{did}' is not in the registry"),
+            format!("'{id}' is not in the registry"),
         )
         .into_response(),
     }
@@ -292,13 +289,13 @@ async fn get_issuer(State(state): State<Arc<AppState>>, Path(did): Path<String>)
 
 async fn check_trust(
     State(state): State<Arc<AppState>>,
-    Path((did, credential_type)): Path<(String, String)>,
+    Path((id, credential_type)): Path<(String, String)>,
 ) -> Response {
     let decision = state
         .registry
         .read()
         .await
-        .check(&did, &credential_type, now_secs());
+        .check(&id, &credential_type, now_secs());
     Json(decision).into_response()
 }
 
@@ -333,7 +330,8 @@ async fn snapshot(State(state): State<Arc<AppState>>) -> Response {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PutBody {
     /// Optional; must match the path when given.
-    did: Option<String>,
+    #[serde(alias = "did")]
+    id: Option<String>,
     role: Role,
     name: Option<String>,
     credential_types: Vec<String>,
@@ -348,21 +346,21 @@ struct PutBody {
 
 async fn put_issuer(
     State(state): State<Arc<AppState>>,
-    Path(did): Path<String>,
+    Path(id): Path<String>,
     body: Result<Json<PutBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     // Compare and store the canonical form, so the path and body may spell
     // the same DID differently.
-    let did = canonical_did(&did);
+    let id = canonical_did(&id);
     let body = match body {
         Ok(Json(b)) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
-    if body.did.as_deref().is_some_and(|d| canonical_did(d) != did) {
-        return error(StatusCode::BAD_REQUEST, "body did does not match the path").into_response();
+    if body.id.as_deref().is_some_and(|d| canonical_did(d) != id) {
+        return error(StatusCode::BAD_REQUEST, "body id does not match the path").into_response();
     }
     let record = IssuerRecord {
-        did: did.clone(),
+        id: id.clone(),
         role: body.role,
         name: body.name,
         credential_types: body.credential_types,
@@ -374,7 +372,7 @@ async fn put_issuer(
     };
     let mut created = false;
     let result = apply(&state, |registry| {
-        created = registry.get(&did).is_none();
+        created = registry.get(&id).is_none();
         registry.upsert(record, now_secs())
     })
     .await;
@@ -385,7 +383,7 @@ async fn put_issuer(
             } else {
                 StatusCode::OK
             };
-            (status, Json(registry.get(&did))).into_response()
+            (status, Json(registry.get(&id))).into_response()
         }
         Err(r) => r.into_response(),
     }
@@ -399,7 +397,7 @@ struct StatusBody {
 
 async fn patch_status(
     State(state): State<Arc<AppState>>,
-    Path(did): Path<String>,
+    Path(id): Path<String>,
     body: Result<Json<StatusBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let body = match body {
@@ -407,17 +405,17 @@ async fn patch_status(
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
     match apply(&state, |registry| {
-        registry.set_status(&did, body.status, now_secs())
+        registry.set_status(&id, body.status, now_secs())
     })
     .await
     {
-        Ok(registry) => Json(registry.get(&did)).into_response(),
+        Ok(registry) => Json(registry.get(&id)).into_response(),
         Err(r) => r.into_response(),
     }
 }
 
-async fn delete_issuer(State(state): State<Arc<AppState>>, Path(did): Path<String>) -> Response {
-    match apply(&state, |registry| registry.remove(&did).map(drop)).await {
+async fn delete_issuer(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match apply(&state, |registry| registry.remove(&id).map(drop)).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(r) => r.into_response(),
     }

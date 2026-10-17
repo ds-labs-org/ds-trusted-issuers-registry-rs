@@ -53,7 +53,11 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssuerRecord {
-    pub did: String,
+    /// The party: a DID (DCP issuers) or an OID4VCI Credential Issuer
+    /// Identifier. Read as `did` too, the key used before OID4VCI issuers
+    /// could be listed.
+    #[serde(alias = "did")]
+    pub id: String,
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

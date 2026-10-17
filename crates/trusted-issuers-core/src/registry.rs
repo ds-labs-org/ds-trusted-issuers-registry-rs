@@ -1,4 +1,4 @@
-//! The registry itself: a DID-keyed set of [`IssuerRecord`]s, the
+//! The registry itself: an issuer-id-keyed set of [`IssuerRecord`]s, the
 //! write-time rules that keep it consistent, and the read-time trust check
 //! that walks an issuer's accreditation chain up to a Root TAO.
 //!
@@ -22,7 +22,7 @@ pub const MAX_CHAIN_DEPTH: usize = 8;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RegistryError {
     #[error("'{0}' is not a DID")]
-    InvalidDid(String),
+    InvalidId(String),
     #[error("credentialTypes must list at least one non-empty type")]
     NoCredentialTypes,
     #[error("only a root_tao may use the '*' credential type")]
@@ -48,11 +48,8 @@ pub enum RegistryError {
     ChainTooLong,
     #[error("'{0}' is listed more than once")]
     Duplicate(String),
-    #[error("'{did}' still accredits {dependents:?}; reassign or remove them first")]
-    HasDependents {
-        did: String,
-        dependents: Vec<String>,
-    },
+    #[error("'{id}' still accredits {dependents:?}; reassign or remove them first")]
+    HasDependents { id: String, dependents: Vec<String> },
     #[error("'{0}' is not in the registry")]
     NotFound(String),
 }
@@ -62,7 +59,7 @@ pub enum RegistryError {
 #[serde(rename_all = "camelCase")]
 pub struct TrustDecision {
     pub trusted: bool,
-    /// The DIDs walked, starting at the issuer. On success it ends at a
+    /// The issuer ids walked, starting at the issuer. On success it ends at a
     /// Root TAO; on failure it ends at the link that failed.
     pub chain: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,34 +87,34 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn get(&self, did: &str) -> Option<&IssuerRecord> {
-        self.issuers.get(&canonical_did(did))
+    pub fn get(&self, id: &str) -> Option<&IssuerRecord> {
+        self.issuers.get(&canonical_did(id))
     }
 
     pub fn list(&self) -> impl Iterator<Item = &IssuerRecord> {
         self.issuers.values()
     }
 
-    /// DIDs of the records whose `accredited_by` is `did`.
-    pub fn dependents_of(&self, did: &str) -> Vec<String> {
-        let did = canonical_did(did);
+    /// Ids of the records whose `accredited_by` is `id`.
+    pub fn dependents_of(&self, id: &str) -> Vec<String> {
+        let id = canonical_did(id);
         self.issuers
             .values()
-            .filter(|r| r.accredited_by.as_deref() == Some(did.as_str()))
-            .map(|r| r.did.clone())
+            .filter(|r| r.accredited_by.as_deref() == Some(id.as_str()))
+            .map(|r| r.id.clone())
             .collect()
     }
 
     /// Inserts or replaces a record after validating it against the
     /// registry's current contents. `now` becomes its `updated_at`. The
-    /// record's `did` and `accredited_by` are stored in [`canonical_did`]
+    /// record's `id` and `accredited_by` are stored in [`canonical_did`]
     /// form, so a rewrite in another spelling replaces instead of
     /// duplicating.
     pub fn upsert(&mut self, mut record: IssuerRecord, now: u64) -> Result<(), RegistryError> {
         canonicalize(&mut record);
         self.validate(&record)?;
         record.updated_at = now;
-        self.issuers.insert(record.did.clone(), record);
+        self.issuers.insert(record.id.clone(), record);
         self.version += 1;
         Ok(())
     }
@@ -125,12 +122,12 @@ impl Registry {
     /// Changes only a record's status. Suspending or revoking a TAO
     /// immediately distrusts everything it accredited, via
     /// [`Registry::check`].
-    pub fn set_status(&mut self, did: &str, status: Status, now: u64) -> Result<(), RegistryError> {
-        let did = canonical_did(did);
+    pub fn set_status(&mut self, id: &str, status: Status, now: u64) -> Result<(), RegistryError> {
+        let id = canonical_did(id);
         let record = self
             .issuers
-            .get_mut(&did)
-            .ok_or(RegistryError::NotFound(did))?;
+            .get_mut(&id)
+            .ok_or(RegistryError::NotFound(id))?;
         record.status = status;
         record.updated_at = now;
         self.version += 1;
@@ -139,30 +136,30 @@ impl Registry {
 
     /// Removes a record. Refused while other records name it as their
     /// accreditor, so a removal never leaves a dangling `accreditedBy`.
-    pub fn remove(&mut self, did: &str) -> Result<IssuerRecord, RegistryError> {
-        let did = canonical_did(did);
-        let dependents = self.dependents_of(&did);
+    pub fn remove(&mut self, id: &str) -> Result<IssuerRecord, RegistryError> {
+        let id = canonical_did(id);
+        let dependents = self.dependents_of(&id);
         if !dependents.is_empty() {
-            return Err(RegistryError::HasDependents { did, dependents });
+            return Err(RegistryError::HasDependents { id, dependents });
         }
         let removed = self
             .issuers
-            .remove(&did)
-            .ok_or(RegistryError::NotFound(did))?;
+            .remove(&id)
+            .ok_or(RegistryError::NotFound(id))?;
         self.version += 1;
         Ok(removed)
     }
 
-    /// Longest line of records below `did` (0 when nothing names it as
+    /// Longest line of records below `id` (0 when nothing names it as
     /// accreditor). Stops counting past [`MAX_CHAIN_DEPTH`].
-    fn descendant_height(&self, did: &str, depth: usize) -> usize {
+    fn descendant_height(&self, id: &str, depth: usize) -> usize {
         if depth > MAX_CHAIN_DEPTH {
             return depth;
         }
         self.issuers
             .values()
-            .filter(|r| r.accredited_by.as_deref() == Some(did))
-            .map(|r| 1 + self.descendant_height(&r.did, depth + 1))
+            .filter(|r| r.accredited_by.as_deref() == Some(id))
+            .map(|r| 1 + self.descendant_height(&r.id, depth + 1))
             .max()
             .unwrap_or(0)
     }
@@ -183,8 +180,8 @@ impl Registry {
         let mut seen = BTreeSet::new();
         for mut record in self.issuers.into_values() {
             canonicalize(&mut record);
-            if !seen.insert(record.did.clone()) {
-                return Err(RegistryError::Duplicate(record.did));
+            if !seen.insert(record.id.clone()) {
+                return Err(RegistryError::Duplicate(record.id));
             }
             pending.push(record);
         }
@@ -206,7 +203,7 @@ impl Registry {
             }
             for record in ready {
                 out.validate(&record)?;
-                out.issuers.insert(record.did.clone(), record);
+                out.issuers.insert(record.id.clone(), record);
             }
             pending = rest;
         }
@@ -214,8 +211,8 @@ impl Registry {
     }
 
     fn validate(&self, record: &IssuerRecord) -> Result<(), RegistryError> {
-        if !is_did(&record.did) {
-            return Err(RegistryError::InvalidDid(record.did.clone()));
+        if !is_did(&record.id) {
+            return Err(RegistryError::InvalidId(record.id.clone()));
         }
         if record.credential_types.is_empty()
             || record.credential_types.iter().any(String::is_empty)
@@ -237,10 +234,10 @@ impl Registry {
         }
         // A record that still accredits others must keep the ability to.
         if !record.role.can_accredit() {
-            let dependents = self.dependents_of(&record.did);
+            let dependents = self.dependents_of(&record.id);
             if !dependents.is_empty() {
                 return Err(RegistryError::HasDependents {
-                    did: record.did.clone(),
+                    id: record.id.clone(),
                     dependents,
                 });
             }
@@ -251,7 +248,7 @@ impl Registry {
             (Role::RootTao, Some(_)) => Err(RegistryError::RootWithAccreditor),
             (role, None) => Err(RegistryError::MissingAccreditor(*role)),
             (_, Some(accreditor_did)) => {
-                if accreditor_did == &record.did {
+                if accreditor_did == &record.id {
                     return Err(RegistryError::Cycle(accreditor_did.clone()));
                 }
                 let accreditor = self
@@ -278,7 +275,7 @@ impl Registry {
                 let mut seen = BTreeSet::new();
                 let mut cursor = Some(accreditor);
                 while let Some(current) = cursor {
-                    if current.did == record.did || !seen.insert(current.did.as_str()) {
+                    if current.id == record.id || !seen.insert(current.id.as_str()) {
                         return Err(RegistryError::Cycle(accreditor_did.clone()));
                     }
                     cursor = current
@@ -288,7 +285,7 @@ impl Registry {
                 }
                 // Refuse chains `check` would always reject: this record's
                 // ancestors, itself, and its longest line of descendants.
-                if seen.len() + 1 + self.descendant_height(&record.did, 0) > MAX_CHAIN_DEPTH {
+                if seen.len() + 1 + self.descendant_height(&record.id, 0) > MAX_CHAIN_DEPTH {
                     return Err(RegistryError::ChainTooLong);
                 }
                 Ok(())
@@ -296,13 +293,13 @@ impl Registry {
         }
     }
 
-    /// Whether `did` may issue a credential of `credential_type` at `now`
+    /// Whether `id` may issue a credential of `credential_type` at `now`
     /// (unix seconds): the issuer and every accreditor up to a Root TAO
     /// must be listed, `Active`, inside their validity window, and scoped
     /// for the type.
-    pub fn check(&self, did: &str, credential_type: &str, now: u64) -> TrustDecision {
+    pub fn check(&self, id: &str, credential_type: &str, now: u64) -> TrustDecision {
         let mut chain = Vec::new();
-        let mut cursor = canonical_did(did);
+        let mut cursor = canonical_did(id);
         loop {
             chain.push(cursor.clone());
             if chain.len() > MAX_CHAIN_DEPTH {
@@ -410,7 +407,7 @@ pub fn canonical_did(did: &str) -> String {
 
 /// Puts a record's DID references in [`canonical_did`] form.
 fn canonicalize(record: &mut IssuerRecord) {
-    record.did = canonical_did(&record.did);
+    record.id = canonical_did(&record.id);
     record.accredited_by = record.accredited_by.as_deref().map(canonical_did);
 }
 
@@ -663,13 +660,13 @@ mod records_as_list {
         let list = Vec::<IssuerRecord>::deserialize(deserializer)?;
         let mut map = BTreeMap::new();
         for record in list {
-            if map.contains_key(&record.did) {
+            if map.contains_key(&record.id) {
                 return Err(serde::de::Error::custom(format!(
                     "'{}' is listed more than once",
-                    record.did
+                    record.id
                 )));
             }
-            map.insert(record.did.clone(), record);
+            map.insert(record.id.clone(), record);
         }
         Ok(map)
     }
@@ -685,7 +682,7 @@ mod tests {
 
     fn record(did: &str, role: Role, types: &[&str], by: Option<&str>) -> IssuerRecord {
         IssuerRecord {
-            did: did.into(),
+            id: did.into(),
             role,
             name: None,
             credential_types: types.iter().map(|t| t.to_string()).collect(),
@@ -808,7 +805,7 @@ mod tests {
         ));
         assert_eq!(
             r.upsert(record("not-a-did", Role::Ti, &["A"], Some(ROOT)), 2),
-            Err(RegistryError::InvalidDid("not-a-did".into()))
+            Err(RegistryError::InvalidId("not-a-did".into()))
         );
         // Demoting a TAO that still accredits someone would orphan them.
         assert!(matches!(
@@ -951,7 +948,7 @@ mod tests {
         // It is kept so the DID echoed back is the canonical form of the one
         // asked for, and so the rule stays right if is_did ever admits such
         // an escape. Only canonical_did's own output (and the DID echoed in
-        // an InvalidDid) shows it, so this test pins it. That a lookup is
+        // an InvalidId) shows it, so this test pins it. That a lookup is
         // echoed in canonical form is pinned by
         // an_unlisted_lookup_is_echoed_in_canonical_form, and that escapes
         // are never decoded or dropped by
@@ -1058,7 +1055,7 @@ mod tests {
                     record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
                     2
                 ),
-                Err(RegistryError::InvalidDid(did.into())),
+                Err(RegistryError::InvalidId(did.into())),
                 "{did}"
             );
         }
@@ -1105,7 +1102,7 @@ mod tests {
         )
         .unwrap();
         let stored = r.get("did:web:new.example%3A8443").unwrap();
-        assert_eq!(stored.did, "did:web:new.example%3A8443");
+        assert_eq!(stored.id, "did:web:new.example%3A8443");
         assert_eq!(stored.accredited_by.as_deref(), Some(TAO));
         // Writing the same DID in another spelling replaces, not duplicates.
         let before = r.issuers.len();
@@ -1145,17 +1142,17 @@ mod tests {
     fn revalidation_canonicalizes_and_rejects_collisions() {
         let mut loose = three_tier();
         let mut ti = loose.issuers.remove(TI).unwrap();
-        ti.did = "did:web:Issuer.example".into();
+        ti.id = "did:web:Issuer.example".into();
         ti.accredited_by = Some("did:web:TAO.example".into());
-        loose.issuers.insert(ti.did.clone(), ti);
+        loose.issuers.insert(ti.id.clone(), ti);
         let fixed = loose.revalidated().unwrap();
         assert!(fixed.issuers.contains_key(TI));
         assert_eq!(fixed.get(TI).unwrap().accredited_by.as_deref(), Some(TAO));
 
         let mut dup = three_tier();
         let mut twin = dup.get(TI).unwrap().clone();
-        twin.did = "did:web:ISSUER.example".into();
-        dup.issuers.insert(twin.did.clone(), twin);
+        twin.id = "did:web:ISSUER.example".into();
+        dup.issuers.insert(twin.id.clone(), twin);
         assert_eq!(dup.revalidated(), Err(RegistryError::Duplicate(TI.into())));
     }
 
@@ -1435,7 +1432,7 @@ mod tests {
                     record(second, Role::Ti, &["MembershipCredential"], Some(TAO)),
                     2
                 ),
-                Err(RegistryError::InvalidDid(second.into()))
+                Err(RegistryError::InvalidId(second.into()))
             );
         }
         assert_eq!(r.issuers.len(), 6);
@@ -1462,7 +1459,7 @@ mod tests {
                     record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
                     2
                 ),
-                Err(RegistryError::InvalidDid(canonical_did(did))),
+                Err(RegistryError::InvalidId(canonical_did(did))),
                 "{did}"
             );
             assert_eq!(r, before, "{did} changed the registry");
@@ -1487,7 +1484,7 @@ mod tests {
             // The error names the DID in canonical form (`%2f` is `%2F`).
             assert_eq!(
                 r.upsert(by_tao(alias), 2),
-                Err(RegistryError::InvalidDid(canonical_did(alias))),
+                Err(RegistryError::InvalidId(canonical_did(alias))),
                 "{alias}"
             );
         }
@@ -1503,11 +1500,11 @@ mod tests {
         ] {
             let mut loose = three_tier();
             let mut ti = loose.issuers.remove(TI).unwrap();
-            ti.did = alias.into();
-            loose.issuers.insert(ti.did.clone(), ti);
+            ti.id = alias.into();
+            loose.issuers.insert(ti.id.clone(), ti);
             assert_eq!(
                 loose.revalidated(),
-                Err(RegistryError::InvalidDid(alias.into())),
+                Err(RegistryError::InvalidId(alias.into())),
                 "{alias}"
             );
         }
@@ -1546,7 +1543,7 @@ mod tests {
         let alias = "did:web:host2.example:.well-known";
         assert_eq!(
             r.upsert(by_tao(alias), 2),
-            Err(RegistryError::InvalidDid(alias.into()))
+            Err(RegistryError::InvalidId(alias.into()))
         );
         // Suspending the host's spelling must distrust the party, so the
         // other spelling can't exist to stay trusted.
@@ -1561,11 +1558,11 @@ mod tests {
     fn a_stored_well_known_path_is_refused_on_load_too() {
         let mut loose = three_tier();
         let mut ti = loose.issuers.remove(TI).unwrap();
-        ti.did = "did:web:issuer.example:.well-known".into();
-        loose.issuers.insert(ti.did.clone(), ti);
+        ti.id = "did:web:issuer.example:.well-known".into();
+        loose.issuers.insert(ti.id.clone(), ti);
         assert_eq!(
             loose.revalidated(),
-            Err(RegistryError::InvalidDid(
+            Err(RegistryError::InvalidId(
                 "did:web:issuer.example:.well-known".into()
             ))
         );
@@ -1577,11 +1574,11 @@ mod tests {
         // instead of listing the same party under two spellings.
         let mut loose = three_tier();
         let mut ti = loose.issuers.remove(TI).unwrap();
-        ti.did = "did:web:issuer.example%3A443".into();
-        loose.issuers.insert(ti.did.clone(), ti);
+        ti.id = "did:web:issuer.example%3A443".into();
+        loose.issuers.insert(ti.id.clone(), ti);
         assert_eq!(
             loose.revalidated(),
-            Err(RegistryError::InvalidDid(
+            Err(RegistryError::InvalidId(
                 "did:web:issuer.example%3A443".into()
             ))
         );
@@ -1599,11 +1596,11 @@ mod tests {
         ] {
             let mut loose = three_tier();
             let mut ti = loose.issuers.remove(TI).unwrap();
-            ti.did = did.into();
-            loose.issuers.insert(ti.did.clone(), ti);
+            ti.id = did.into();
+            loose.issuers.insert(ti.id.clone(), ti);
             assert_eq!(
                 loose.revalidated(),
-                Err(RegistryError::InvalidDid(did.into())),
+                Err(RegistryError::InvalidId(did.into())),
                 "{did}"
             );
         }
@@ -1622,7 +1619,7 @@ mod tests {
                 ),
                 2
             ),
-            Err(RegistryError::InvalidDid(
+            Err(RegistryError::InvalidId(
                 "did:web:tenant.example%2FAlice".into()
             ))
         );
@@ -1638,7 +1635,7 @@ mod tests {
                 record(url, Role::Ti, &["MembershipCredential"], Some(TAO)),
                 2
             ),
-            Err(RegistryError::InvalidDid(url.into()))
+            Err(RegistryError::InvalidId(url.into()))
         );
         assert_eq!(r.version, 3);
     }
