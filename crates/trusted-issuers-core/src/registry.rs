@@ -1308,6 +1308,64 @@ mod tests {
     }
 
     #[test]
+    fn a_did_web_path_cannot_name_the_bare_host_document() {
+        for valid in [
+            // `.well-known` is only the bare host's document when it is the
+            // whole path; anywhere else it is an ordinary directory name.
+            "did:web:example.com:.well-known:alice",
+            "did:web:example.com:alice:.well-known",
+            "did:web:example.com:well-known",
+            "did:web:example.com:.well-known2",
+            // Path segments keep their case, so this is another directory.
+            "did:web:example.com:.Well-Known",
+        ] {
+            assert!(is_did(valid), "{valid} should be valid");
+        }
+        for invalid in [
+            // The resolver turns the bare host into
+            // https://host/.well-known/did.json, and a sole `.well-known`
+            // path segment into the very same URL.
+            "did:web:example.com:.well-known",
+            "did:web:localhost%3A8443:.well-known",
+        ] {
+            assert!(!is_did(invalid), "{invalid} should be invalid");
+        }
+    }
+
+    #[test]
+    fn a_party_cannot_be_stored_as_both_its_host_and_its_well_known_path() {
+        let mut r = three_tier();
+        let by_tao = |did: &str| record(did, Role::Ti, &["MembershipCredential"], Some(TAO));
+        r.upsert(by_tao("did:web:host2.example"), 2).unwrap();
+        let alias = "did:web:host2.example:.well-known";
+        assert_eq!(
+            r.upsert(by_tao(alias), 2),
+            Err(RegistryError::InvalidDid(alias.into()))
+        );
+        // Suspending the host's spelling must distrust the party, so the
+        // other spelling can't exist to stay trusted.
+        r.set_status("did:web:host2.example", Status::Suspended, 3)
+            .unwrap();
+        assert!(!r.check(alias, "MembershipCredential", 10).trusted);
+        assert!(r.get(alias).is_none());
+        assert_eq!(r.issuers.len(), 4);
+    }
+
+    #[test]
+    fn a_stored_well_known_path_is_refused_on_load_too() {
+        let mut loose = three_tier();
+        let mut ti = loose.issuers.remove(TI).unwrap();
+        ti.did = "did:web:issuer.example:.well-known".into();
+        loose.issuers.insert(ti.did.clone(), ti);
+        assert_eq!(
+            loose.revalidated(),
+            Err(RegistryError::InvalidDid(
+                "did:web:issuer.example:.well-known".into()
+            ))
+        );
+    }
+
+    #[test]
     fn a_stored_default_port_is_refused_on_load_too() {
         // Data written before `host%3A443` was refused must fail startup
         // instead of listing the same party under two spellings.
