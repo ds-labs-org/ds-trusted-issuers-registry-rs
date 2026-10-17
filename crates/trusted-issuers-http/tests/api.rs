@@ -584,3 +584,241 @@ async fn did_urls_and_malformed_dids_are_refused_with_422() {
     let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
     assert_eq!(body["total"], 3);
 }
+
+// An OID4VCI credential issuer is named by an https URL. In a path it is one
+// percent-encoded segment: each "/" is sent as "%2F" (and a "%" as "%25").
+const OID4VCI_TI: &str = "https://issuers.example/tenants/acme";
+const OID4VCI_TI_PATH: &str = "https:%2F%2Fissuers.example%2Ftenants%2Facme";
+// An SD-JWT VC type (vct) is often a URL too, and is encoded the same way.
+const PID_VCT: &str = "https://credentials.example/identity_credential";
+const PID_VCT_PATH: &str = "https:%2F%2Fcredentials.example%2Fidentity_credential";
+
+/// The registry from [`seed`] plus an OID4VCI issuer accredited by the TAO
+/// for `MembershipCredential` and by the root for the PID `vct`.
+async fn seed_with_oid4vci(s: &Arc<AppState>) {
+    seed(s).await;
+    let (status, body, _) = call(
+        s,
+        "PUT",
+        "/v1/issuers/did:web:pid-tao.example",
+        Some(TOKEN),
+        Some(json!({"role": "tao", "credentialTypes": [PID_VCT, "MembershipCredential"], "accreditedBy": ROOT, "status": "active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body, _) = call(
+        s,
+        "PUT",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}"),
+        Some(TOKEN),
+        Some(json!({
+            "role": "ti", "name": "ACME (OID4VCI)",
+            "credentialTypes": [PID_VCT, "MembershipCredential"],
+            "accreditedBy": "did:web:pid-tao.example", "status": "active"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["id"], OID4VCI_TI);
+}
+
+#[tokio::test]
+async fn oid4vci_issuers_are_maintained_next_to_dcp_issuers() {
+    let s = state(Some(TOKEN), None);
+    seed_with_oid4vci(&s).await;
+
+    let (status, body, _) = call(
+        &s,
+        "GET",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], OID4VCI_TI);
+
+    // The trust check, with a URL issuer and a URL credential type.
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}/types/{PID_VCT_PATH}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(body["trusted"], true, "{body}");
+    assert_eq!(
+        body["chain"],
+        json!([OID4VCI_TI, "did:web:pid-tao.example", ROOT])
+    );
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        &format!(
+            "/v1/issuers?credentialType={}",
+            PID_VCT.replace('/', "%2F").replace(':', "%3A")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        body["total"], 3,
+        "root, pid-tao and the OID4VCI issuer: {body}"
+    );
+
+    // Status changes and removal work on URL ids like on DIDs.
+    let (status, body, _) = call(
+        &s,
+        "PATCH",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}/status"),
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}/types/MembershipCredential"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(body["trusted"], false, "{body}");
+    let (status, _, _) = call(
+        &s,
+        "DELETE",
+        &format!("/v1/issuers/{OID4VCI_TI_PATH}"),
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn oid4vci_issuer_ids_are_canonicalized_on_write_and_lookup() {
+    let s = state(Some(TOKEN), None);
+    seed_with_oid4vci(&s).await;
+
+    // Same issuer, upper-case scheme and host in the path, canonical in the
+    // body: a replace (200), not a mismatch (400) or a second record.
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        "/v1/issuers/HTTPS:%2F%2FIssuers.Example%2Ftenants%2Facme",
+        Some(TOKEN),
+        Some(json!({
+            "id": OID4VCI_TI,
+            "role": "ti", "credentialTypes": ["MembershipCredential"],
+            "accreditedBy": "did:web:pid-tao.example", "status": "active"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], OID4VCI_TI);
+    let (_, body, _) = call(
+        &s,
+        "GET",
+        "/v1/issuers/https:%2F%2FISSUERS.example%2Ftenants%2Facme/types/MembershipCredential",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(body["trusted"], true, "{body}");
+    // The path is case-sensitive.
+    let (status, _, _) = call(
+        &s,
+        "GET",
+        "/v1/issuers/https:%2F%2Fissuers.example%2Ftenants%2FACME",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn malformed_and_aliased_oid4vci_issuer_ids_are_refused_with_422() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    for path in [
+        "http:%2F%2Fissuer.example",
+        "https:%2F%2Fissuer.example%3Ftenant=acme",
+        "https:%2F%2Fissuer.example%2F",
+        "https:%2F%2Fissuer.example:443",
+        "https:%2F%2F127.0.0.1",
+        "https:%2F%2Falice@issuer.example",
+        "https:%2F%2Fissuer.example%2F%252E%252E%2Facme",
+    ] {
+        let (status, body, _) = call(
+            &s,
+            "PUT",
+            &format!("/v1/issuers/{path}"),
+            Some(TOKEN),
+            Some(json!({
+                "role": "ti", "credentialTypes": ["MembershipCredential"],
+                "accreditedBy": TAO, "status": "active"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {body}");
+    }
+    let (_, body, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(body["total"], 3);
+}
+
+#[tokio::test]
+async fn list_filters_by_id_kind() {
+    let s = state(Some(TOKEN), None);
+    seed_with_oid4vci(&s).await;
+    let ids = |body: &Value| -> Vec<String> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // A governance console's "OID4VCI issuers" and "DCP issuers" tabs.
+    let (status, body, _) = call(&s, "GET", "/v1/issuers?idKind=url", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids(&body), vec![OID4VCI_TI]);
+    let (_, body, _) = call(&s, "GET", "/v1/issuers?idKind=did&role=ti", None, None).await;
+    assert_eq!(ids(&body), vec![TI]);
+    let (_, body, _) = call(&s, "GET", "/v1/issuers?idKind=did", None, None).await;
+    assert_eq!(body["total"], 4);
+
+    let (status, _, _) = call(&s, "GET", "/v1/issuers?idKind=https", None, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn oid4vci_issuers_survive_the_snapshot_and_the_data_file() {
+    let dir = std::env::temp_dir().join(format!("tir-oid4vci-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("registry.json");
+    let _ = std::fs::remove_file(&file);
+    let s = state(Some(TOKEN), Some(file.clone()));
+    seed_with_oid4vci(&s).await;
+
+    let reloaded = load(&file, false).unwrap();
+    assert_eq!(reloaded, *s.registry.read().await);
+    assert!(reloaded.get(OID4VCI_TI).is_some());
+
+    let (_, token, _) = call(&s, "GET", "/v1/snapshot", None, None).await;
+    let token = token.as_str().unwrap();
+    let (_, doc, _) = call(&s, "GET", "/.well-known/did.json", None, None).await;
+    let doc = serde_json::from_value(doc).unwrap();
+    let key = find_verifying_key(&doc, &snapshot_kid(token).unwrap()).unwrap();
+    let list = verify_snapshot(token, REGISTRY_DID, &key, dcp_core::now_secs()).unwrap();
+    let now = dcp_core::now_secs();
+    assert!(list.check(OID4VCI_TI, PID_VCT, now).trusted);
+    assert!(list.check(TI, "MembershipCredential", now).trusted);
+    assert!(!list.check(TI, PID_VCT, now).trusted);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
