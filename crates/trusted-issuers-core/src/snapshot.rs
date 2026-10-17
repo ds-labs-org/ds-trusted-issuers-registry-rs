@@ -113,6 +113,23 @@ impl TrustList {
         self.registry.check(id, credential_type, now)
     }
 
+    /// [`Registry::check_x5c`] against the snapshot, refused once it
+    /// expired, like [`TrustList::check`].
+    pub fn check_x5c(
+        &self,
+        x5c: &[String],
+        credential_type: &str,
+        now: u64,
+        eku: Option<&str>,
+    ) -> TrustDecision {
+        let _ = (x5c, credential_type, now, eku);
+        TrustDecision {
+            trusted: false,
+            chain: vec![],
+            reason: Some("not implemented".into()),
+        }
+    }
+
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
@@ -213,6 +230,7 @@ mod tests {
                 valid_from: None,
                 valid_until: None,
                 status: Status::Active,
+                x509_certificates: Vec::new(),
                 updated_at: 0,
             },
             1,

@@ -100,6 +100,14 @@ pub struct IssuerRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<u64>,
     pub status: Status,
+    /// X.509 trust anchors of this party, base64 (standard, padded) DER as
+    /// in a JOSE `x5c`: the certificates its credentials' certificate
+    /// chains end at, for issuers proven by X.509 rather than by a DID or
+    /// issuer metadata (an mdoc/mDL issuing authority's IACA root, the CA of
+    /// an SD-JWT VC issuer signing with `x5c`). See
+    /// [`crate::Registry::check_x5c`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub x509_certificates: Vec<String>,
     /// Unix seconds of the last write, set by the registry.
     #[serde(default)]
     pub updated_at: u64,

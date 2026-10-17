@@ -7,6 +7,7 @@ pub mod audit;
 pub mod model;
 pub mod registry;
 pub mod snapshot;
+pub mod x509;
 
 pub use audit::{
     AuditAction, AuditEntry, AuditError, AuditRecord, GENESIS_HASH, verify_audit_chain,
@@ -20,3 +21,4 @@ pub use snapshot::{
     SNAPSHOT_CLOCK_SKEW_SECS, SNAPSHOT_TYP, SnapshotError, SnapshotPayload, TrustList,
     sign_snapshot, snapshot_kid, verify_snapshot,
 };
+pub use x509::{MAX_ANCHOR_BYTES, MAX_ANCHORS_PER_RECORD, oid_der};

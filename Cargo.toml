@@ -15,8 +15,11 @@ members = [
 
 # RocksDB (under oxigraph's `rocksdb` feature) is a large C++ build; with
 # debug info each build of it takes ~1.8 GB of target/. Nobody steps through
-# RocksDB, so build it without.
+# RocksDB, so build it (and the other C/C++ sys crates) without.
 [profile.dev.package.oxrocksdb-sys]
+debug = false
+
+[profile.dev.package.ring]
 debug = false
 
 [workspace.package]
@@ -40,6 +43,10 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 clap = { version = "4", features = ["derive", "env"] }
+# X.509 chain validation for trust anchors (network-free; ring backend).
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "alloc", "std"] }
+rustls-pki-types = "1"
+base64 = "0.22"
 # SHA-256 for the audit log's hash chain; the same 0.10 line p256 uses.
 sha2 = "0.10"
 

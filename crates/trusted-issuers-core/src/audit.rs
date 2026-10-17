@@ -159,6 +159,7 @@ mod tests {
             valid_from: None,
             valid_until: None,
             status,
+            x509_certificates: Vec::new(),
             updated_at: 7,
         }
     }

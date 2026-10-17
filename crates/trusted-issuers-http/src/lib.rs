@@ -437,6 +437,7 @@ async fn put_issuer(
         valid_from: body.valid_from,
         valid_until: body.valid_until,
         status: body.status,
+        x509_certificates: Vec::new(),
         updated_at: 0,
     };
     let mut created = false;

@@ -52,6 +52,10 @@ pub enum RegistryError {
     HasDependents { id: String, dependents: Vec<String> },
     #[error("'{0}' is not in the registry")]
     NotFound(String),
+    #[error("x509Certificates[{index}] is not a usable trust anchor: {reason}")]
+    InvalidCertificate { index: usize, reason: String },
+    #[error("that X.509 trust anchor is already listed for '{other}'")]
+    DuplicateAnchor { other: String },
 }
 
 /// Outcome of [`Registry::check`].
@@ -817,6 +821,7 @@ mod tests {
             valid_from: None,
             valid_until: None,
             status: Status::Active,
+            x509_certificates: Vec::new(),
             updated_at: 0,
         }
     }
