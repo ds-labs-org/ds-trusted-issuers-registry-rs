@@ -70,6 +70,23 @@ struct Cli {
     #[arg(long, value_parser = parse_header_name)]
     audit_actor_header: Option<String>,
 
+    /// `SchemeOperatorName` of the published LoTE (`GET /v1/lote`).
+    #[arg(long, default_value = "Dataspace authority")]
+    lote_operator_name: String,
+
+    /// `LoTEType` URI of the published LoTE.
+    #[arg(long, default_value = trusted_issuers_core::DEFAULT_LOTE_TYPE)]
+    lote_type: String,
+
+    /// `SchemeTerritory` of the published LoTE (ISO 3166-1 alpha-2, or EU).
+    #[arg(long)]
+    lote_territory: Option<String>,
+
+    /// Public base URL of the registry API, for the LoTE's addresses and
+    /// distribution point. Defaults to the https origin of its did:web.
+    #[arg(long)]
+    public_base_url: Option<String>,
+
     /// How long a signed snapshot stays valid, in seconds.
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
     snapshot_ttl_secs: u64,
@@ -186,6 +203,16 @@ async fn main() -> Result<(), String> {
     if let Some(name) = &cli.audit_actor_header {
         state = state.with_audit_actor_header(name);
     }
+    let base_url = cli
+        .public_base_url
+        .clone()
+        .unwrap_or_else(|| trusted_issuers_http::base_url_of(&state.key.own_did));
+    state = state.with_lote(trusted_issuers_core::LoteOptions {
+        operator_name: cli.lote_operator_name.clone(),
+        base_url,
+        lote_type: cli.lote_type.clone(),
+        territory: cli.lote_territory.clone(),
+    });
     let state = Arc::new(state);
     if !state.admin_enabled() {
         tracing::warn!("no (or an empty) admin token configured: the admin API is disabled");
@@ -204,6 +231,23 @@ async fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::did_from_host;
+
+    #[test]
+    fn the_lote_base_url_is_the_did_web_origin() {
+        use trusted_issuers_http::base_url_of;
+        assert_eq!(
+            base_url_of("did:web:registry.example"),
+            "https://registry.example"
+        );
+        assert_eq!(
+            base_url_of("did:web:localhost%3A8090"),
+            "https://localhost:8090"
+        );
+        assert_eq!(
+            base_url_of("did:web:host.example:tir"),
+            "https://host.example/tir"
+        );
+    }
 
     #[test]
     fn did_host_is_validated() {

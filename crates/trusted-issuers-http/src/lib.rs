@@ -17,6 +17,8 @@
 //! - `POST /v1/x509/check` - `{x5c, credentialType, eku?}`: whether a
 //!   certificate chain proves an issuer trusted for that type, via a listed
 //!   X.509 trust anchor and that party's accreditation chain
+//! - `GET /v1/lote` / `GET /v1/lote.jws` - the registry as an ETSI TS 119
+//!   602 List of Trusted Entities (JSON binding), plain or signed
 //! - `GET /v1/snapshot` - the whole registry as a signed compact JWS
 //!   (`application/trust-list+jwt`)
 //!
@@ -51,8 +53,9 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 use trusted_issuers_core::{
-    AccreditationError, AuditAction, AuditEntry, AuditRecord, IdKind, IssuerRecord, Registry,
-    RegistryError, Role, Status, canonical_id, issue_accreditations, sign_snapshot,
+    AccreditationError, AuditAction, AuditEntry, AuditRecord, DEFAULT_LOTE_TYPE, IdKind,
+    IssuerRecord, LoteOptions, Registry, RegistryError, Role, Status, build_lote, canonical_id,
+    issue_accreditations, sign_lote, sign_snapshot,
 };
 
 pub use store::{GraphStore, JsonFileStore, MemoryStore, Store, audit_file, load, persist};
@@ -71,6 +74,8 @@ pub struct AppState {
     /// gateway after it authenticated them; `None` records every write as
     /// `admin`.
     audit_actor_header: Option<header::HeaderName>,
+    /// Who publishes the LoTE (`GET /v1/lote`) and where.
+    pub lote: LoteOptions,
     pub snapshot_ttl_secs: u64,
 }
 
@@ -85,12 +90,19 @@ impl AppState {
         store: Arc<dyn Store>,
         snapshot_ttl_secs: u64,
     ) -> Self {
+        let key_did = key.own_did.clone();
         Self {
             registry: RwLock::new(registry),
             key,
             admin_token: admin_token.filter(|t| !t.trim().is_empty()),
             store,
             audit_actor_header: None,
+            lote: LoteOptions {
+                operator_name: "Dataspace authority".into(),
+                base_url: base_url_of(&key_did),
+                lote_type: DEFAULT_LOTE_TYPE.into(),
+                territory: None,
+            },
             snapshot_ttl_secs,
         }
     }
@@ -107,6 +119,14 @@ impl AppState {
     pub fn with_audit_actor_header(mut self, name: &str) -> Self {
         self.audit_actor_header =
             Some(header::HeaderName::try_from(name).expect("a valid header name"));
+        self
+    }
+
+    /// Sets who publishes the LoTE and where (defaults: "Dataspace
+    /// authority", the registry's own `did:web` origin, [`DEFAULT_LOTE_TYPE`],
+    /// no territory).
+    pub fn with_lote(mut self, lote: LoteOptions) -> Self {
+        self.lote = lote;
         self
     }
 
@@ -131,6 +151,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/issuers/{id}/accreditations", get(accreditations))
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/x509/check", post(check_x5c))
+        .route("/v1/lote", get(lote))
+        .route("/v1/lote.jws", get(lote_signed))
         .merge(admin)
         .with_state(state)
 }
@@ -434,6 +456,59 @@ async fn check_x5c(
         body.eku.as_deref(),
     );
     Json(decision).into_response()
+}
+
+/// The https origin a `did:web` resolves to: `did:web:host%3A8443:a:b` is
+/// `https://host:8443/a/b`.
+pub fn base_url_of(did: &str) -> String {
+    let rest = did.strip_prefix("did:web:").unwrap_or(did);
+    let mut segments = rest.split(':');
+    let host = segments
+        .next()
+        .unwrap_or_default()
+        .replacen("%3A", ":", 1)
+        .replacen("%3a", ":", 1);
+    let path: Vec<&str> = segments.collect();
+    if path.is_empty() {
+        format!("https://{host}")
+    } else {
+        format!("https://{host}/{}", path.join("/"))
+    }
+}
+
+fn current_lote(state: &AppState, registry: &Registry) -> serde_json::Value {
+    build_lote(registry, &state.lote, now_secs(), state.snapshot_ttl_secs)
+}
+
+/// The cache lifetime of a published list: a quarter of its TTL, as for the
+/// snapshot.
+fn lote_cache_control(state: &AppState) -> String {
+    format!("public, max-age={}", state.snapshot_ttl_secs / 4)
+}
+
+/// `GET /v1/lote`: the registry as an ETSI TS 119 602 List of Trusted
+/// Entities, JSON binding.
+async fn lote(State(state): State<Arc<AppState>>) -> Response {
+    let lote = current_lote(&state, &*state.registry.read().await);
+    (
+        [(header::CACHE_CONTROL, lote_cache_control(&state))],
+        Json(lote),
+    )
+        .into_response()
+}
+
+/// `GET /v1/lote.jws`: the same list as a compact JWS signed by the
+/// registry key (`application/jose`).
+async fn lote_signed(State(state): State<Arc<AppState>>) -> Response {
+    let lote = current_lote(&state, &*state.registry.read().await);
+    (
+        [
+            (header::CONTENT_TYPE, "application/jose".to_string()),
+            (header::CACHE_CONTROL, lote_cache_control(&state)),
+        ],
+        sign_lote(&lote, &state.key),
+    )
+        .into_response()
 }
 
 async fn snapshot(State(state): State<Arc<AppState>>) -> Response {
