@@ -1176,11 +1176,10 @@ mod tests {
         for valid in [
             "did:web:example.com:user:Alice",
             "did:web:localhost%3A8443:user:Alice",
-            // Escapes of reserved characters and of `~` (which DID Core's
-            // idchar can only write that way) are not RFC 3986 aliases of a
-            // plain character.
+            // Escapes of reserved characters other than `/` and of `~`
+            // (which DID Core's idchar can only write that way) are not
+            // RFC 3986 aliases of a plain character.
             "did:web:example.com:user%7Ex",
-            "did:web:example.com:a%2Fb",
             "did:web:example.com:a%3Ab",
             // Only a segment that is exactly `.` or `..` is a dot segment.
             "did:web:example.com:.a",
@@ -1213,9 +1212,36 @@ mod tests {
             "did:web:example.com:user%2Dx:Alice",
             "did:web:example.com:a%5Fb",
             "did:web:example.com:%30",
+            // A server that decodes `%2F` before it removes dot segments
+            // serves another path's document, so `%2F` is refused in either
+            // case instead of proving what each server does.
+            "did:web:example.com:a%2Fb",
+            "did:web:example.com:a%2fb",
+            "did:web:example.com:%2F",
+            "did:web:example.com:bob%2F..%2Falice",
+            "did:web:localhost%3A8443:bob%2f..%2fAlice",
         ] {
             assert!(!is_did(invalid), "{invalid} should be invalid");
         }
+    }
+
+    #[test]
+    fn did_web_path_segments_are_not_empty() {
+        // An empty segment makes `//` in the URL, which a server that merges
+        // slashes serves as the path without it: `did:web:host::alice` would
+        // alias `did:web:host:alice`.
+        for invalid in [
+            "did:web:example.com::alice",
+            "did:web:example.com:user::alice",
+            "did:web:example.com:user:::alice",
+            "did:web:localhost%3A8443::alice",
+        ] {
+            assert!(!is_did(invalid), "{invalid} should be invalid");
+        }
+        // DID Core's grammar allows empty segments, and other methods keep
+        // them.
+        assert!(is_did("did:x::a"));
+        assert!(is_did("did:web:example.com:user:alice"));
     }
 
     #[test]
@@ -1292,6 +1318,9 @@ mod tests {
             "did:web:host.example:bob:%2E%2E:alice",
             "did:web:host.example:%61lice",
             "did:web:host.example:alice:.",
+            "did:web:host.example:bob%2F..%2Falice",
+            "did:web:host.example:bob%2f..%2falice",
+            "did:web:host.example::alice",
         ] {
             assert_eq!(
                 r.upsert(by_tao(alias), 2),
@@ -1304,16 +1333,21 @@ mod tests {
 
     #[test]
     fn a_stored_path_alias_is_refused_on_load_too() {
-        let mut loose = three_tier();
-        let mut ti = loose.issuers.remove(TI).unwrap();
-        ti.did = "did:web:issuer.example:bob:%2E%2E:alice".into();
-        loose.issuers.insert(ti.did.clone(), ti);
-        assert_eq!(
-            loose.revalidated(),
-            Err(RegistryError::InvalidDid(
-                "did:web:issuer.example:bob:%2E%2E:alice".into()
-            ))
-        );
+        for alias in [
+            "did:web:issuer.example:bob:%2E%2E:alice",
+            "did:web:issuer.example:bob%2F..%2Falice",
+            "did:web:issuer.example::alice",
+        ] {
+            let mut loose = three_tier();
+            let mut ti = loose.issuers.remove(TI).unwrap();
+            ti.did = alias.into();
+            loose.issuers.insert(ti.did.clone(), ti);
+            assert_eq!(
+                loose.revalidated(),
+                Err(RegistryError::InvalidDid(alias.into())),
+                "{alias}"
+            );
+        }
     }
 
     #[test]
