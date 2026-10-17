@@ -54,6 +54,8 @@ x509-cert = { version = "0.2", default-features = false }
 rcgen = "0.14"
 # SHA-256 for the audit log's hash chain; the same 0.10 line p256 uses.
 sha2 = "0.10"
+# Random credential ids (`urn:uuid:`) for accreditation VCs.
+uuid = { version = "1", features = ["v4"] }
 
 # Contreforts-backed storage (crates/trusted-issuers-graph,
 # crates/trusted-issuers-contreforts), on the same Oxigraph line as

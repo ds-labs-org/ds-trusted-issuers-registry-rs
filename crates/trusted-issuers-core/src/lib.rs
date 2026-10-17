@@ -15,8 +15,8 @@ pub mod snapshot;
 pub mod x509;
 
 pub use accreditation::{
-    ACCREDITATION_TYP, AccreditationChain, AccreditationError, issue_accreditations,
-    verify_accreditations,
+    ACCREDITATION_SCHEMA_ID, ACCREDITATION_TYP, AccreditationChain, AccreditationError,
+    CREDENTIAL_TYPE_BASE, issue_accreditations, verify_accreditations,
 };
 pub use audit::{
     AuditAction, AuditEntry, AuditError, AuditRecord, GENESIS_HASH, verify_audit_chain,

@@ -5,15 +5,26 @@
 //! [`verify_accreditations`] turns a set of them back into an
 //! [`AccreditationChain`] that answers the same trust check as the registry.
 //!
-//! The VCs follow the shape of EBSI's `VerifiableAccreditation` (types
-//! `VerifiableAccreditationToAttest` for a TI, `...ToAccredit` for a TAO,
-//! `VerifiableAuthorisationForTrustChain` for the Root TAO, scope in
-//! `credentialSubject.accreditedFor[].types`, the accreditor in
-//! `termsOfUse`), encoded as a VCDM 1.1 JWT (`vc` claim, as `jwt_vc_json`).
-//! One difference: in EBSI each accreditation is signed by the accreditor,
-//! here the registry signs every link, since it does not hold the
-//! accreditors' keys. A verifier therefore needs only the registry's key,
-//! as for the snapshot.
+//! The VCs conform to EBSI's Verifiable Accreditation schema
+//! (`@cef-ebsi/vcdm1.1-accreditation-schema` 2.0.0, checked by the
+//! conformance suite): types `VerifiableAccreditationToAttest` for a TI,
+//! `...ToAccredit` for a TAO, `VerifiableAuthorisationForTrustChain` for the
+//! Root TAO; one `credentialSubject.accreditedFor` entry per credential type
+//! in scope; the accreditor in an `IssuanceCertificate` `termsOfUse` (the
+//! Root TAO's points at the registry as a `TrustFrameworkPolicy`), encoded
+//! as a VCDM 1.1 JWT (`vc` claim, as `jwt_vc_json`). Differences from EBSI:
+//!
+//! - Each accreditation is signed by the registry, not by the accreditor,
+//!   since the registry does not hold the accreditors' keys. A verifier
+//!   therefore needs only the registry's key, as for the snapshot.
+//! - `accreditedFor[].schemaId` must be a URI, but a credential type is
+//!   often a bare name (`MembershipCredential`) with no schema registered
+//!   anywhere: a type that is already an absolute URI (an SD-JWT VC `vct`)
+//!   is its own `schemaId`, any other gets one under [`CREDENTIAL_TYPE_BASE`].
+//! - `reservedAttributeId` (EBSI's registry attribute) is the SHA-256 of the
+//!   party's id, hex, so it is stable per party.
+//! - There is no `credentialStatus`: an accreditation lives no longer than
+//!   the snapshot TTL instead.
 
 use std::collections::BTreeMap;
 
@@ -28,6 +39,16 @@ use crate::snapshot::sign_with_typ;
 
 /// `typ` of an accreditation JWT.
 pub const ACCREDITATION_TYP: &str = "JWT";
+
+/// `credentialSchema` of every accreditation: EBSI's Verifiable
+/// Accreditation schema as published to the pilot Trusted Schemas Registry
+/// (its multibase id, from the schema's npm package).
+pub const ACCREDITATION_SCHEMA_ID: &str = "https://api-pilot.ebsi.eu/trusted-schemas-registry/v3/schemas/zHXHLkJpZg4w9nt2GbEBbyE8uhkfirbmT3nF7mJ9kFnjv";
+
+/// Base of the `schemaId` given to a credential type that is not itself a
+/// URI: the type, percent-encoded, follows it.
+pub const CREDENTIAL_TYPE_BASE: &str =
+    "https://ds42.org/ontologies/ds-trusted-issuers-registry-rs/credential-types/";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AccreditationError {
@@ -121,11 +142,53 @@ fn link_type(role: Role) -> &'static str {
     }
 }
 
+/// Whether `s` is an absolute URI: a scheme (RFC 3986 section 3.1), a
+/// colon, and nothing a URI may not hold.
+fn is_absolute_uri(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once(':') else {
+        return false;
+    };
+    let mut scheme_chars = scheme.chars();
+    scheme_chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme_chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+        && !rest.is_empty()
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !b"\"<>\\^`{|}".contains(&b))
+}
+
+/// The `schemaId` standing for `credential_type`.
+fn schema_id(credential_type: &str) -> String {
+    if is_absolute_uri(credential_type) {
+        return credential_type.to_string();
+    }
+    let mut id = CREDENTIAL_TYPE_BASE.to_string();
+    for b in credential_type.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            id.push(b as char);
+        } else {
+            id.push_str(&format!("%{b:02X}"));
+        }
+    }
+    id
+}
+
 fn accreditation_payload(record: &IssuerRecord, iss: &str, now: u64, exp: u64) -> Value {
+    use sha2::{Digest, Sha256};
+    let accredited_for: Vec<Value> = record
+        .credential_types
+        .iter()
+        .map(|t| json!({"schemaId": schema_id(t), "types": [t]}))
+        .collect();
+    let reserved_attribute_id: String = Sha256::digest(record.id.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     let mut subject = json!({
         "id": record.id,
+        "reservedAttributeId": reserved_attribute_id,
         "role": record.role,
-        "accreditedFor": [{"types": record.credential_types}],
+        "accreditedFor": accredited_for,
     });
     if let Some(name) = &record.name {
         subject["name"] = json!(name);
@@ -138,17 +201,24 @@ fn accreditation_payload(record: &IssuerRecord, iss: &str, now: u64, exp: u64) -
         types.push("VerifiableAccreditation");
     }
     types.push(link_type(record.role));
-    let mut vc = json!({
+    let terms_of_use = match &record.accredited_by {
+        Some(by) => json!({"id": by, "type": "IssuanceCertificate"}),
+        None => json!({"id": iss, "type": "TrustFrameworkPolicy"}),
+    };
+    let issued = crate::iso8601_utc(now);
+    let vc = json!({
         "@context": ["https://www.w3.org/2018/credentials/v1"],
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         "type": types,
         "issuer": iss,
-        "issuanceDate": crate::iso8601_utc(now),
+        "issuanceDate": issued,
+        "issued": issued,
+        "validFrom": issued,
         "expirationDate": crate::iso8601_utc(exp),
         "credentialSubject": subject,
+        "credentialSchema": {"id": ACCREDITATION_SCHEMA_ID, "type": "FullJsonSchemaValidator2021"},
+        "termsOfUse": terms_of_use,
     });
-    if let Some(by) = &record.accredited_by {
-        vc["termsOfUse"] = json!({"id": by, "type": "IssuanceCertificate"});
-    }
     json!({"iss": iss, "sub": record.id, "iat": now, "nbf": now, "exp": exp, "vc": vc})
 }
 
@@ -243,12 +313,31 @@ fn verify_one(
             })
             .unwrap_or_default()
     };
+    // EBSI allows one entry or a list for both; the scope is the union of
+    // every entry's types, the accreditor the IssuanceCertificate's id.
+    let entries = |v: &Value| match v {
+        Value::Array(items) => items.clone(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    };
+    let mut credential_types: Vec<String> = Vec::new();
+    for entry in entries(&subject["accreditedFor"]) {
+        for t in strings(&entry["types"]) {
+            if !credential_types.contains(&t) {
+                credential_types.push(t);
+            }
+        }
+    }
+    let accredited_by = entries(&vc["termsOfUse"])
+        .iter()
+        .find(|terms| terms["type"] == "IssuanceCertificate")
+        .and_then(|terms| terms["id"].as_str().map(str::to_string));
     Ok(IssuerRecord {
         id: id.to_string(),
         role,
         name: subject["name"].as_str().map(str::to_string),
-        credential_types: strings(&subject["accreditedFor"][0]["types"]),
-        accredited_by: vc["termsOfUse"]["id"].as_str().map(str::to_string),
+        credential_types,
+        accredited_by,
         valid_from: Some(nbf),
         valid_until: Some(exp),
         status: Status::Active,
@@ -349,8 +438,21 @@ mod tests {
         assert_eq!(ti["vc"]["issuer"], REGISTRY_DID);
         assert_eq!(ti["vc"]["credentialSubject"]["id"], TI);
         assert_eq!(
-            ti["vc"]["credentialSubject"]["accreditedFor"][0]["types"],
-            serde_json::json!(["MembershipCredential"])
+            ti["vc"]["credentialSubject"]["accreditedFor"],
+            serde_json::json!([{
+                "schemaId": format!("{CREDENTIAL_TYPE_BASE}MembershipCredential"),
+                "types": ["MembershipCredential"]
+            }])
+        );
+        assert!(ti["vc"]["id"].as_str().unwrap().starts_with("urn:uuid:"));
+        assert_eq!(ti["vc"]["credentialSchema"]["id"], ACCREDITATION_SCHEMA_ID);
+        assert_eq!(ti["vc"]["validFrom"], ti["vc"]["issuanceDate"]);
+        assert_eq!(
+            ti["vc"]["credentialSubject"]["reservedAttributeId"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
         );
         assert_eq!(ti["vc"]["termsOfUse"]["id"], TAO);
         assert_eq!(ti["vc"]["termsOfUse"]["type"], "IssuanceCertificate");
@@ -371,7 +473,28 @@ mod tests {
                 .iter()
                 .any(|x| x == "VerifiableAuthorisationForTrustChain")
         );
-        assert!(root["vc"].get("termsOfUse").is_none());
+        assert_eq!(
+            root["vc"]["termsOfUse"],
+            serde_json::json!({"id": REGISTRY_DID, "type": "TrustFrameworkPolicy"})
+        );
+    }
+
+    #[test]
+    fn credential_types_get_a_uri_schema_id() {
+        assert_eq!(
+            schema_id("https://credentials.example/pid"),
+            "https://credentials.example/pid"
+        );
+        assert_eq!(
+            schema_id("urn:eu.europa.ec.eudi:pid:1"),
+            "urn:eu.europa.ec.eudi:pid:1"
+        );
+        assert_eq!(schema_id("*"), format!("{CREDENTIAL_TYPE_BASE}%2A"));
+        assert_eq!(
+            schema_id("Diploma 2:x"),
+            format!("{CREDENTIAL_TYPE_BASE}Diploma%202%3Ax")
+        );
+        assert_eq!(schema_id("1x:y"), format!("{CREDENTIAL_TYPE_BASE}1x%3Ay"));
     }
 
     #[test]

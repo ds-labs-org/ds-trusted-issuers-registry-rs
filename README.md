@@ -282,19 +282,31 @@ let chain = trusted_issuers_core::verify_accreditations(&tokens, registry_did, &
 let decision = chain.check(issuer_id, "MembershipCredential", now);
 ```
 
-They follow the shape of EBSI's `VerifiableAccreditation`: VCDM 1.1 JWT
-encoding (`vc` claim, `typ: JWT`), types `VerifiableAccreditationToAttest`
-(TI), `VerifiableAccreditationToAccredit` (TAO) or
-`VerifiableAuthorisationForTrustChain` (Root TAO), the scope in
-`credentialSubject.accreditedFor[0].types`, the accreditor in `termsOfUse`
-(`IssuanceCertificate`), and any X.509 anchors in
-`credentialSubject.x509Certificates`. One difference from EBSI: there each
-accreditation is signed by the accreditor; here the registry signs every
-link, since it does not hold the accreditors' keys. Every link expires at
-the earliest of now plus `--snapshot-ttl-secs` and each link's
-`validUntil`, so a suspension stops new accreditations at once and old ones
-expire within one TTL. The registry refuses to issue them for a chain that
-is broken now.
+They conform to EBSI's Verifiable Accreditation schema
+(`@cef-ebsi/vcdm1.1-accreditation-schema` 2.0.0, checked by the
+[conformance suite](#conformance)): VCDM 1.1 JWT encoding (`vc` claim,
+`typ: JWT`), a `urn:uuid:` id, types `VerifiableAccreditationToAttest` (TI),
+`VerifiableAccreditationToAccredit` (TAO) or
+`VerifiableAuthorisationForTrustChain` (Root TAO), one
+`credentialSubject.accreditedFor` entry per credential type in scope, the
+accreditor in an `IssuanceCertificate` `termsOfUse` (the Root TAO's is a
+`TrustFrameworkPolicy` naming the registry), `credentialSchema` pointing at
+the schema's id in the EBSI pilot Trusted Schemas Registry, and any X.509
+anchors in `credentialSubject.x509Certificates`. Differences from EBSI:
+
+- There each accreditation is signed by the accreditor; here the registry
+  signs every link, since it does not hold the accreditors' keys.
+- `accreditedFor[].schemaId` must be a URI, and a credential type often
+  has no registered schema: a type that is already an absolute URI (an
+  SD-JWT VC `vct`) is its own `schemaId`, any other (`MembershipCredential`)
+  gets `https://ds42.org/ontologies/ds-trusted-issuers-registry-rs/credential-types/`
+  followed by the percent-encoded type.
+- `reservedAttributeId` is the hex SHA-256 of the party's id, and there is
+  no `credentialStatus`: every link expires at the earliest of now plus
+  `--snapshot-ttl-secs` and each link's `validUntil`, so a suspension stops
+  new accreditations at once and old ones expire within one TTL.
+
+The registry refuses to issue them for a chain that is broken now.
 
 ### ETSI LoTE export
 
