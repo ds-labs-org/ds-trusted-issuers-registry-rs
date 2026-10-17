@@ -2443,6 +2443,7 @@ name = "trusted-issuers-graph"
 version = "0.1.0"
 dependencies = [
  "oxigraph",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

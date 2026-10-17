@@ -10,6 +10,7 @@ description = "Embedded Oxigraph RDF store for the trusted issuers registry: iss
 [dependencies]
 trusted-issuers-core = { path = "../trusted-issuers-core" }
 oxigraph = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # oxigraph's SPARQL engine (spareval) accepts sha2 0.10 or 0.11 but only
