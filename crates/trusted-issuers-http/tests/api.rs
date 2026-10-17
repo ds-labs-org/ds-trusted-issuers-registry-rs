@@ -11,7 +11,9 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use trusted_issuers_core::{snapshot_kid, verify_snapshot};
-use trusted_issuers_http::{AppState, SNAPSHOT_CONTENT_TYPE, load, router};
+use trusted_issuers_http::{
+    AppState, JsonFileStore, MemoryStore, SNAPSHOT_CONTENT_TYPE, Store, load, router,
+};
 
 const REGISTRY_DID: &str = "did:web:registry.example";
 const ROOT: &str = "did:web:authority.example";
@@ -22,11 +24,18 @@ const TI_PATH: &str = "did:web:issuer.example%253A8443";
 const TOKEN: &str = "s3cret";
 
 fn state(admin_token: Option<&str>, data_file: Option<std::path::PathBuf>) -> Arc<AppState> {
+    let (store, registry): (Arc<dyn Store>, _) = match data_file {
+        Some(path) => {
+            let (store, registry) = JsonFileStore::open(&path, true).unwrap();
+            (Arc::new(store), registry)
+        }
+        None => (Arc::new(MemoryStore::new()), Default::default()),
+    };
     Arc::new(AppState::new(
-        Default::default(),
+        registry,
         DcpKeyPair::generate(REGISTRY_DID.into()),
         admin_token.map(Into::into),
-        data_file,
+        store,
         600,
     ))
 }

@@ -31,10 +31,9 @@
 //! (`did:web:host%3A8080`) is sent as `did:web:host%253A8080`, and
 //! `https://issuer.example/tenant` as `https:%2F%2Fissuer.example%2Ftenant`.
 
-use std::io::Write;
-use std::path::{Path as FsPath, PathBuf};
+pub mod store;
+
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
@@ -47,8 +46,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 use trusted_issuers_core::{
-    IdKind, IssuerRecord, Registry, RegistryError, Role, Status, canonical_id, sign_snapshot,
+    AuditAction, AuditEntry, AuditRecord, IdKind, IssuerRecord, Registry, RegistryError, Role,
+    Status, canonical_id, sign_snapshot,
 };
+
+pub use store::{JsonFileStore, MemoryStore, Store, load, persist};
 
 pub const SNAPSHOT_CONTENT_TYPE: &str = "application/trust-list+jwt";
 
@@ -58,9 +60,8 @@ pub struct AppState {
     /// `None` disables the admin API (every write is refused). Never
     /// `Some("")`: [`AppState::new`] maps an empty token to `None`.
     admin_token: Option<String>,
-    /// Where the registry is persisted after each write; `None` keeps it in
-    /// memory only.
-    pub data_file: Option<PathBuf>,
+    /// Where each write is made durable, together with its audit entry.
+    pub store: Arc<dyn Store>,
     pub snapshot_ttl_secs: u64,
 }
 
@@ -72,14 +73,14 @@ impl AppState {
         registry: Registry,
         key: DcpKeyPair,
         admin_token: Option<String>,
-        data_file: Option<PathBuf>,
+        store: Arc<dyn Store>,
         snapshot_ttl_secs: u64,
     ) -> Self {
         Self {
             registry: RwLock::new(registry),
             key,
             admin_token: admin_token.filter(|t| !t.trim().is_empty()),
-            data_file,
+            store,
             snapshot_ttl_secs,
         }
     }
@@ -104,60 +105,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/snapshot", get(snapshot))
         .merge(admin)
         .with_state(state)
-}
-
-/// Loads a registry persisted by [`persist`] and re-checks it against the
-/// write rules, so a hand-edited file can't smuggle in what the API would
-/// refuse. A missing file is an error unless `create_if_missing`, so an
-/// unmounted volume or a mistyped path doesn't silently serve an empty
-/// registry.
-pub fn load(path: &FsPath, create_if_missing: bool) -> Result<Registry, String> {
-    let registry: Registry = match std::fs::read(path) {
-        Ok(bytes) => {
-            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
-            return Ok(Registry::default());
-        }
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    registry
-        .revalidated()
-        .map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// Writes the registry to `path` atomically and durably: a uniquely named
-/// temp file in the same directory (created exclusively, so a planted file
-/// or symlink is never written through), fsynced, renamed over `path`,
-/// then the directory fsynced so the rename survives a power loss.
-pub fn persist(path: &FsPath, registry: &Registry) -> std::io::Result<()> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => FsPath::new("."),
-    };
-    let name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("data file path has no file name"))?
-        .to_string_lossy();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        file.write_all(&serde_json::to_vec_pretty(registry)?)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::File::open(dir)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
 }
 
 /// A JSON `{"error": ...}` response, kept small so `Result<_, ApiError>`
@@ -222,35 +169,55 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Applies a write to a copy of the registry, persists the copy, and only
-/// then makes it live, so memory and disk never disagree after a failed
-/// write. Writes are rare, so copying the registry is cheap enough. Disk
-/// I/O runs on the blocking pool; the write lock is held across it, which
-/// serializes writes (readers wait for at most one fsync).
+/// Applies a write to a copy of the registry, commits the copy and its
+/// audit entry to the store, and only then makes it live, so memory and the
+/// store never disagree after a failed write. Writes are rare, so copying
+/// the registry is cheap enough. Store I/O runs on the blocking pool; the
+/// write lock is held across it, which serializes writes (readers wait for
+/// at most one commit) and keeps the audit chain in order.
 async fn apply(
     state: &AppState,
+    actor: String,
+    action: AuditAction,
+    id: &str,
     write: impl FnOnce(&mut Registry) -> Result<(), RegistryError>,
 ) -> Result<Registry, ApiError> {
+    let id = canonical_id(id);
     let mut registry = state.registry.write().await;
     let mut next = registry.clone();
     write(&mut next).map_err(registry_error)?;
-    if let Some(path) = state.data_file.clone() {
-        let to_save = next.clone();
-        let result =
-            tokio::task::spawn_blocking(move || persist(&path, &to_save).map_err(|e| (path, e)))
-                .await
-                .map_err(|e| (PathBuf::new(), std::io::Error::other(e)))
-                .and_then(|r| r);
-        if let Err((path, e)) = result {
-            tracing::error!("failed to persist registry to {}: {e}", path.display());
-            return Err(error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the registry could not be persisted; nothing was changed",
-            ));
-        }
+    let entry = AuditEntry::next(
+        state.store.audit_head().as_ref(),
+        AuditRecord {
+            at: now_secs(),
+            actor,
+            action,
+            before: registry.get(&id).cloned(),
+            after: next.get(&id).cloned(),
+            id,
+            version: next.version,
+        },
+    );
+    let store = state.store.clone();
+    let to_save = next.clone();
+    let result = tokio::task::spawn_blocking(move || store.commit(&to_save, &entry))
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
+    if let Err(e) = result {
+        tracing::error!("failed to commit a registry write: {e}");
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the registry could not be persisted; nothing was changed",
+        ));
     }
     *registry = next.clone();
     Ok(next)
+}
+
+/// Who is making an admin write, for the audit log.
+fn actor() -> String {
+    "admin".to_string()
 }
 
 async fn did_document(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -376,7 +343,7 @@ async fn put_issuer(
         updated_at: 0,
     };
     let mut created = false;
-    let result = apply(&state, |registry| {
+    let result = apply(&state, actor(), AuditAction::Put, &id, |registry| {
         created = registry.get(&id).is_none();
         registry.upsert(record, now_secs())
     })
@@ -409,7 +376,7 @@ async fn patch_status(
         Ok(Json(b)) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
-    match apply(&state, |registry| {
+    match apply(&state, actor(), AuditAction::Status, &id, |registry| {
         registry.set_status(&id, body.status, now_secs())
     })
     .await
@@ -420,7 +387,11 @@ async fn patch_status(
 }
 
 async fn delete_issuer(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match apply(&state, |registry| registry.remove(&id).map(drop)).await {
+    match apply(&state, actor(), AuditAction::Delete, &id, |registry| {
+        registry.remove(&id).map(drop)
+    })
+    .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(r) => r.into_response(),
     }

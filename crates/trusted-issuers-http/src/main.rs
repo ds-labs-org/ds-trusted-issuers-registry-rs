@@ -7,7 +7,7 @@ use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
 use trusted_issuers_core::{is_did_web_port, is_dns_name};
-use trusted_issuers_http::{AppState, load, router};
+use trusted_issuers_http::{AppState, JsonFileStore, MemoryStore, Store, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
 /// this dataspace.
@@ -123,9 +123,12 @@ async fn main() -> Result<(), String> {
         }
     };
 
-    let registry: trusted_issuers_core::Registry = match &cli.data_file {
-        Some(path) => load(path, cli.create_data_file)?,
-        None => Default::default(),
+    let (store, registry): (Arc<dyn Store>, trusted_issuers_core::Registry) = match &cli.data_file {
+        Some(path) => {
+            let (store, registry) = JsonFileStore::open(path, cli.create_data_file)?;
+            (Arc::new(store), registry)
+        }
+        None => (Arc::new(MemoryStore::new()), Default::default()),
     };
     tracing::info!(
         did = %key.own_did,
@@ -139,7 +142,7 @@ async fn main() -> Result<(), String> {
         registry,
         key,
         cli.admin_token,
-        cli.data_file,
+        store,
         cli.snapshot_ttl_secs,
     ));
     if !state.admin_enabled() {
