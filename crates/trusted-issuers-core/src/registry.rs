@@ -1651,4 +1651,21 @@ mod tests {
         let back: Registry = serde_json::from_value(json).unwrap();
         assert_eq!(back, r);
     }
+
+    #[test]
+    fn records_are_written_with_id_and_legacy_did_still_reads() {
+        // A record names its party with `id`, which holds a DID (DCP) or an
+        // OID4VCI credential issuer URL, so the key is not called `did`.
+        let json = serde_json::to_value(three_tier()).unwrap();
+        let first = &json["issuers"][0];
+        assert_eq!(first["id"], ROOT, "{first}");
+        assert!(first.get("did").is_none(), "{first}");
+
+        // Data files and snapshots written before the rename still load.
+        let legacy = serde_json::json!({"version": 1, "issuers": [
+            {"did": ROOT, "role": "root_tao", "credentialTypes": ["*"], "status": "active"}
+        ]});
+        let r: Registry = serde_json::from_value(legacy).unwrap();
+        assert!(r.get(ROOT).is_some());
+    }
 }
