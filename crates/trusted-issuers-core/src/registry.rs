@@ -953,6 +953,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unlisted_lookup_is_echoed_in_canonical_form() {
+        // The DID echoed back is the canonical form of what was asked, not
+        // the text as written: host lowercased and escapes uppercased, but
+        // the case after an escape kept.
+        let mut r = three_tier();
+        let asked = "did:web:Example.COM%2fAlice";
+        let canonical = "did:web:example.com%2FAlice";
+        let d = r.check(asked, "MembershipCredential", 10);
+        assert!(!d.trusted);
+        assert_eq!(d.chain, vec![canonical]);
+        assert!(d.reason.is_some_and(|reason| reason.contains(canonical)));
+        assert_eq!(
+            r.set_status(asked, Status::Revoked, 5),
+            Err(RegistryError::NotFound(canonical.into()))
+        );
+        assert_eq!(
+            r.remove(asked),
+            Err(RegistryError::NotFound(canonical.into()))
+        );
+    }
+
+    #[test]
     fn a_lookup_with_an_escaped_host_never_matches_a_stored_host() {
         // Such DIDs can't be stored (is_did refuses them), but lookups take
         // any string. canonical_did never decodes, adds or drops an escape,
