@@ -66,9 +66,11 @@ malformed `%` escapes are refused with 422. A `did:web` host must be a DNS
 name with an optional `%3A` and port, so that each party has one spelling:
 labels of `[A-Za-z0-9-]`, 1-63 characters, not starting or ending with
 `-`, no empty label or trailing dot (`example.com.`), and no IP address;
-the port is 1-65535 without leading zeros (`%3A08443`). Any other escape
-in the host (`did:web:example.com%2FAlice`) is refused too. `--did-host`
-applies the same rules to the registry's own DID.
+the port is 1-65535 without leading zeros (`%3A08443`) and is not 443
+(`did:web:host%3A443` fetches the same document as `did:web:host`, since
+did:web always uses https). Any other escape in the host
+(`did:web:example.com%2FAlice`) is refused too. `--did-host` applies the
+same rules to the registry's own DID.
 
 **Upgrading.** On startup, data files and snapshots are re-checked under
 this DID syntax and canonical form. A record whose DID is now invalid or
@@ -77,8 +79,8 @@ the DID; fix or remove it in the file before upgrading. Besides DID URLs
 (`#fragment`, `?query`), that covers `did:web` hosts that earlier versions
 accepted: escapes other than the port's `%3A` (`%2F`, `%40`, ...), `_`,
 empty or hyphen-edged labels, a trailing dot, IP addresses, and ports that
-are 0, above 65535 or written with leading zeros. `--did-host` likewise
-refuses an IP address or a port with leading zeros.
+are 0, above 65535, 443 or written with leading zeros. `--did-host`
+likewise refuses an IP address, port 443 or a port with leading zeros.
 
 ## API
 

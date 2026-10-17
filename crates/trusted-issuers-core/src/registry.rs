@@ -503,12 +503,15 @@ pub fn is_dns_name(host: &str) -> bool {
             .is_some_and(|last| !last.bytes().all(|c| c.is_ascii_digit()))
 }
 
-/// Whether `port` is a TCP port written one way only: decimal digits, no
-/// leading zero, 1-65535. `08443` is the same port as `8443`, so accepting
-/// it would give a did:web party a second spelling.
+/// Whether `port` is the port of a did:web host, written one way only:
+/// decimal digits, no leading zero, 1-65535, and not 443. `08443` is the
+/// same port as `8443`, and did:web always resolves over https, whose
+/// default port is 443, so `host:443` fetches the same document as `host`.
+/// Accepting either would give a did:web party a second spelling.
 pub fn is_port(port: &str) -> bool {
     !port.is_empty()
         && !port.starts_with('0')
+        && port != "443"
         && port.bytes().all(|c| c.is_ascii_digit())
         && port.parse::<u16>().is_ok()
 }
