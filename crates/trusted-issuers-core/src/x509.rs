@@ -8,7 +8,10 @@
 //! finds the record whose anchor the presented chain validates against
 //! (with `rustls-webpki`: signatures, validity periods, CA constraints,
 //! path length and name constraints, and optionally an extended key usage),
-//! then runs the ordinary accreditation-chain check on that record. Both
+//! then runs the ordinary accreditation-chain check on that record. webpki
+//! takes an anchor as given, so the registry adds two checks of its own: an
+//! anchor must be a CA certificate (checked on write) and inside its
+//! validity period (checked at `now`). Both
 //! must pass: a valid chain to the anchor of a suspended party, or of one
 //! not scoped for the credential type, is not trusted.
 
@@ -20,7 +23,7 @@ use webpki::{EndEntityCert, ExtendedKeyUsageValidator, KeyPurposeId, KeyPurposeI
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
 use x509_cert::der::oid::{AssociatedOid, ObjectIdentifier};
-use x509_cert::ext::pkix::ExtendedKeyUsage;
+use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage};
 
 use crate::model::IssuerRecord;
 use crate::registry::{Registry, RegistryError, TrustDecision};
@@ -58,7 +61,8 @@ fn decode(b64: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Checks a record's `x509Certificates` on write: each decodes, is at most
-/// [`MAX_ANCHOR_BYTES`], parses as a trust anchor and is listed once, at
+/// [`MAX_ANCHOR_BYTES`], parses as a trust anchor, is a CA certificate
+/// (`basicConstraints` with `cA` set) and is listed once, at
 /// most [`MAX_ANCHORS_PER_RECORD`] of them, and none is listed under
 /// another record (one anchor, one party, so a chain never proves two
 /// issuers).
@@ -85,6 +89,12 @@ pub(crate) fn check_anchors(
         let cert = CertificateDer::from(der.as_slice());
         webpki::anchor_from_trusted_cert(&cert)
             .map_err(|e| invalid(index, format!("not an X.509 certificate: {e}")))?;
+        if !is_ca(&der) {
+            return Err(invalid(
+                index,
+                "not a CA certificate (no basicConstraints with cA set)".into(),
+            ));
+        }
         if seen.contains(&der) {
             return Err(invalid(index, "listed twice".into()));
         }
@@ -147,6 +157,30 @@ fn leaf_has_eku(leaf: &[u8], oid: &ObjectIdentifier) -> bool {
         .filter(|ext| ext.extn_id == ExtendedKeyUsage::OID)
         .filter_map(|ext| ExtendedKeyUsage::from_der(ext.extn_value.as_bytes()).ok())
         .any(|eku| eku.0.contains(oid))
+}
+
+/// Whether `der` carries `basicConstraints` with `cA` set.
+fn is_ca(der: &[u8]) -> bool {
+    let Ok(cert) = Certificate::from_der(der) else {
+        return false;
+    };
+    cert.tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .filter(|ext| ext.extn_id == BasicConstraints::OID)
+        .filter_map(|ext| BasicConstraints::from_der(ext.extn_value.as_bytes()).ok())
+        .any(|bc| bc.ca)
+}
+
+/// Whether `der` is inside its validity period at `now` (unix seconds).
+fn is_valid_at(der: &[u8], now: u64) -> bool {
+    let Ok(cert) = Certificate::from_der(der) else {
+        return false;
+    };
+    let validity = &cert.tbs_certificate.validity;
+    let now = Duration::from_secs(now);
+    validity.not_before.to_unix_duration() <= now && now <= validity.not_after.to_unix_duration()
 }
 
 fn untrusted(reason: impl Into<String>) -> TrustDecision {
@@ -212,13 +246,19 @@ impl Registry {
         };
         let time = UnixTime::since_unix_epoch(Duration::from_secs(now));
         let mut last_error = None;
+        let mut listed = false;
         for record in self.list().filter(|r| !r.x509_certificates.is_empty()) {
+            listed = true;
             let ders: Vec<CertificateDer<'static>> = record
                 .x509_certificates
                 .iter()
                 .filter_map(|b64| decode(b64).ok())
+                .filter(|der| is_valid_at(der, now))
                 .map(CertificateDer::from)
                 .collect();
+            if ders.is_empty() {
+                continue;
+            }
             let anchors: Vec<TrustAnchor<'_>> = ders
                 .iter()
                 .filter_map(|der| webpki::anchor_from_trusted_cert(der).ok())
@@ -237,6 +277,7 @@ impl Registry {
             }
         }
         untrusted(match last_error {
+            None if listed => "no listed trust anchor is valid at this time".to_string(),
             None => "no record lists an X.509 trust anchor".to_string(),
             Some(e) => format!(
                 "the certificate chain does not validate against a listed trust anchor: {e}"
