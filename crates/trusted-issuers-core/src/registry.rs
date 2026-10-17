@@ -1346,6 +1346,59 @@ mod tests {
     }
 
     #[test]
+    fn did_web_host_refuses_what_url_parsing_reads_as_ipv4() {
+        // WHATWG URL parsing (the url crate under the resolver) reads a host
+        // whose last label is all digits, or `0x` and hex digits (none
+        // included), as an IPv4 address: every one of these is fetched from
+        // 127.0.0.1 (or 0.0.0.0), which did:web forbids and which would give
+        // that one address many spellings.
+        for ip in [
+            "0x7f000001",
+            "0X7F000001",
+            "0x7f.0x1",
+            "0x7f.0.0.0x1",
+            "0x7F.0.0.1",
+            "0x",
+            "0X",
+            "0x0",
+            // url refuses these ("invalid IPv4 address"), so nobody can
+            // resolve them either.
+            "a.0x",
+            "example.0x10",
+            "example.0X",
+            "a.0x1b",
+        ] {
+            assert!(!is_dns_name(ip), "{ip} should not be a DNS name");
+            for did in [
+                format!("did:web:{ip}"),
+                format!("did:web:{ip}%3A8443"),
+                format!("did:web:{ip}:alice"),
+            ] {
+                assert!(!is_did(&did), "{did} should be invalid");
+            }
+        }
+        // Only the last label decides, and only `0x` followed by nothing but
+        // hex digits does: these stay names to url.
+        for name in [
+            "0xg.example",
+            "a.0x1b.example",
+            "0x.example",
+            "0xff.example",
+            "example.0xg",
+            "example.0x1g",
+            "0xg",
+            "0x1g",
+            "example.0b1",
+            "x0.example",
+            "a0x1",
+        ] {
+            assert!(is_dns_name(name), "{name} should be a DNS name");
+            let did = format!("did:web:{name}");
+            assert!(is_did(&did), "{did} should be valid");
+        }
+    }
+
+    #[test]
     fn a_party_cannot_be_stored_under_a_second_host_spelling() {
         let mut r = three_tier();
         for (first, second) in [
@@ -1370,6 +1423,34 @@ mod tests {
             );
         }
         assert_eq!(r.issuers.len(), 6);
+    }
+
+    #[test]
+    fn a_hex_ipv4_host_cannot_be_stored_as_an_alias_of_an_address() {
+        // Each of these is fetched from https://127.0.0.1/, as is
+        // `did:web:127.0.0.1`, which is refused: storing two of them and
+        // suspending one would leave the other trusted.
+        let mut r = three_tier();
+        let before = r.clone();
+        for did in [
+            "did:web:0x7f000001",
+            "did:web:0X7F000001",
+            "did:web:0x7f.0x1",
+            "did:web:0x7f.0.0.0x1",
+            "did:web:0x7f000001:alice",
+            "did:web:0x7f.0.0.0x1:alice",
+            "did:web:0x7f000001%3A8443",
+        ] {
+            assert_eq!(
+                r.upsert(
+                    record(did, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                    2
+                ),
+                Err(RegistryError::InvalidDid(canonical_did(did))),
+                "{did}"
+            );
+            assert_eq!(r, before, "{did} changed the registry");
+        }
     }
 
     #[test]
@@ -1488,6 +1569,28 @@ mod tests {
                 "did:web:issuer.example%3A443".into()
             ))
         );
+    }
+
+    #[test]
+    fn a_stored_hex_ipv4_host_is_refused_on_load_too() {
+        // Data written while `did:web:0x7f000001` was accepted must fail
+        // startup instead of listing one address under many spellings.
+        for did in [
+            "did:web:0x7f000001",
+            "did:web:0x7f.0x1",
+            "did:web:0x7f.0.0.0x1:alice",
+            "did:web:example.0x10",
+        ] {
+            let mut loose = three_tier();
+            let mut ti = loose.issuers.remove(TI).unwrap();
+            ti.did = did.into();
+            loose.issuers.insert(ti.did.clone(), ti);
+            assert_eq!(
+                loose.revalidated(),
+                Err(RegistryError::InvalidDid(did.into())),
+                "{did}"
+            );
+        }
     }
 
     #[test]

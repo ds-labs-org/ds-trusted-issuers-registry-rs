@@ -197,11 +197,38 @@ mod tests {
     }
 
     #[test]
+    fn did_host_refuses_what_url_parsing_reads_as_ipv4() {
+        // url reads a last label of `0x` and hex digits as a number, so each
+        // of these is 127.0.0.1 (or refused by url) and is no more a name
+        // than `127.0.0.1` is.
+        for bad in [
+            "0x7f000001",
+            "0X7F000001",
+            "0x7f.0x1",
+            "0x7f.0.0.0x1",
+            "0x7f000001:8090",
+            "0x",
+            "example.0x10",
+        ] {
+            assert!(did_from_host(bad).is_err(), "{bad}");
+        }
+        // Names that merely contain `0x` stay names.
+        assert_eq!(
+            did_from_host("0xg.Example:8090").unwrap(),
+            "did:web:0xg.example%3A8090"
+        );
+        assert_eq!(
+            did_from_host("a.0x1b.example").unwrap(),
+            "did:web:a.0x1b.example"
+        );
+    }
+
+    #[test]
     fn did_host_443_error_says_to_omit_the_port() {
         let err = did_from_host("Localhost:443").unwrap_err();
         assert!(err.contains("omit ':443'"), "{err}");
         // Other bad hosts keep the general message.
-        for bad in ["localhost:08090", "a..b", "127.0.0.1"] {
+        for bad in ["localhost:08090", "a..b", "127.0.0.1", "0x7f000001:443"] {
             let err = did_from_host(bad).unwrap_err();
             assert!(!err.contains("443"), "{bad}: {err}");
         }
