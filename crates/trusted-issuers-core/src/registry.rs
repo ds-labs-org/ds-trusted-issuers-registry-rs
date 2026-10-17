@@ -88,7 +88,7 @@ pub struct Registry {
 
 impl Registry {
     pub fn get(&self, id: &str) -> Option<&IssuerRecord> {
-        self.issuers.get(&canonical_did(id))
+        self.issuers.get(&canonical_id(id))
     }
 
     pub fn list(&self) -> impl Iterator<Item = &IssuerRecord> {
@@ -97,7 +97,7 @@ impl Registry {
 
     /// Ids of the records whose `accredited_by` is `id`.
     pub fn dependents_of(&self, id: &str) -> Vec<String> {
-        let id = canonical_did(id);
+        let id = canonical_id(id);
         self.issuers
             .values()
             .filter(|r| r.accredited_by.as_deref() == Some(id.as_str()))
@@ -123,7 +123,7 @@ impl Registry {
     /// immediately distrusts everything it accredited, via
     /// [`Registry::check`].
     pub fn set_status(&mut self, id: &str, status: Status, now: u64) -> Result<(), RegistryError> {
-        let id = canonical_did(id);
+        let id = canonical_id(id);
         let record = self
             .issuers
             .get_mut(&id)
@@ -137,7 +137,7 @@ impl Registry {
     /// Removes a record. Refused while other records name it as their
     /// accreditor, so a removal never leaves a dangling `accreditedBy`.
     pub fn remove(&mut self, id: &str) -> Result<IssuerRecord, RegistryError> {
-        let id = canonical_did(id);
+        let id = canonical_id(id);
         let dependents = self.dependents_of(&id);
         if !dependents.is_empty() {
             return Err(RegistryError::HasDependents { id, dependents });
@@ -299,7 +299,7 @@ impl Registry {
     /// for the type.
     pub fn check(&self, id: &str, credential_type: &str, now: u64) -> TrustDecision {
         let mut chain = Vec::new();
-        let mut cursor = canonical_did(id);
+        let mut cursor = canonical_id(id);
         loop {
             chain.push(cursor.clone());
             if chain.len() > MAX_CHAIN_DEPTH {
@@ -405,10 +405,16 @@ pub fn canonical_did(did: &str) -> String {
     format!("did:web:{}", segments.join(":"))
 }
 
-/// Puts a record's DID references in [`canonical_did`] form.
+/// The canonical spelling of an issuer id, which is what the registry
+/// stores and looks up by: [`canonical_did`] for a DID.
+pub fn canonical_id(id: &str) -> String {
+    canonical_did(id)
+}
+
+/// Puts a record's id references in [`canonical_id`] form.
 fn canonicalize(record: &mut IssuerRecord) {
-    record.id = canonical_did(&record.id);
-    record.accredited_by = record.accredited_by.as_deref().map(canonical_did);
+    record.id = canonical_id(&record.id);
+    record.accredited_by = record.accredited_by.as_deref().map(canonical_id);
 }
 
 /// Uppercases the two hex digits of every `%xx` escape in `s`.
@@ -1848,5 +1854,144 @@ mod tests {
             );
             assert_eq!(r.version, 3, "{id}");
         }
+    }
+
+    #[test]
+    fn credential_issuer_ids_are_stored_and_looked_up_in_canonical_form() {
+        // Scheme and host are case-insensitive to every URL parser, and an
+        // escape's hex digits are too; the path is case-sensitive.
+        let mut r = three_tier();
+        r.upsert(
+            record(
+                "HTTPS://Issuer.EXAMPLE:8443/Tenant/caf%c3%a9",
+                Role::Tao,
+                &["MembershipCredential"],
+                Some(TAO),
+            ),
+            2,
+        )
+        .unwrap();
+        let canonical = "https://issuer.example:8443/Tenant/caf%C3%A9";
+        assert_eq!(r.get(canonical).map(|x| x.id.as_str()), Some(canonical));
+        assert!(
+            r.get("https://ISSUER.example:8443/Tenant/caf%c3%A9")
+                .is_some()
+        );
+        assert!(
+            r.get("https://issuer.example:8443/tenant/caf%C3%A9")
+                .is_none()
+        );
+
+        // accreditedBy in another spelling resolves to the same party.
+        r.upsert(
+            record(
+                OID4VCI_TI,
+                Role::Ti,
+                &["MembershipCredential"],
+                Some("https://ISSUER.example:8443/Tenant/caf%C3%a9"),
+            ),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            r.get(OID4VCI_TI).unwrap().accredited_by.as_deref(),
+            Some(canonical)
+        );
+        let d = r.check("Https://Issuer.Example", "MembershipCredential", 10);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec![OID4VCI_TI, canonical, TAO, ROOT]);
+
+        // A rewrite in another spelling replaces instead of duplicating.
+        let before = r.issuers.len();
+        r.upsert(
+            record(
+                "https://Issuer.example",
+                Role::Ti,
+                &["MembershipCredential"],
+                Some(TAO),
+            ),
+            3,
+        )
+        .unwrap();
+        assert_eq!(r.issuers.len(), before);
+        assert_eq!(
+            canonical_id("HTTPS://X.Example/A%2f"),
+            "https://x.example/A%2F"
+        );
+        assert_eq!(canonical_id("did:web:X.example"), "did:web:x.example");
+        assert_eq!(canonical_id("did:key:zAbC"), "did:key:zAbC");
+    }
+
+    #[test]
+    fn a_credential_issuer_cannot_be_stored_under_a_second_spelling() {
+        // Each of these fetches the same issuer metadata as an identifier
+        // without the alias (or as another listed one), so storing it would
+        // list one party twice, or let a record read as another tenant.
+        for alias in [
+            // https's default port.
+            "https://issuer.example:443",
+            "https://issuer.example:443/tenant",
+            // A port with a leading zero.
+            "https://issuer.example:08443",
+            // A trailing slash: OID4VCI removes it before building the
+            // metadata URL, and URL parsers add one to a bare origin.
+            "https://issuer.example/",
+            "https://issuer.example/tenant/",
+            // Empty segments, which servers that merge slashes drop.
+            "https://issuer.example//tenant",
+            "https://issuer.example/a//tenant",
+            // Dot segments, which URL parsing removes.
+            "https://issuer.example/.",
+            "https://issuer.example/./tenant",
+            "https://issuer.example/x/../tenant",
+            "https://issuer.example/..",
+            // Escaped unreserved characters, which servers decode.
+            "https://issuer.example/%2E%2E/tenant",
+            "https://issuer.example/%2e",
+            "https://issuer.example/%61cme",
+            "https://issuer.example/%7Ealice",
+            "https://issuer.example/a%5Fb",
+            // An encoded slash hides a path separator in one segment.
+            "https://issuer.example/x%2F..%2Ftenant",
+            "https://issuer.example/a%2fb",
+            // Host spellings did:web refuses for the same reason.
+            "https://issuer.example.",
+            "https://0x7f000001",
+            "https://example.0x10",
+        ] {
+            let mut r = three_tier();
+            assert_eq!(
+                r.upsert(
+                    record(alias, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                    2
+                ),
+                Err(RegistryError::InvalidId(canonical_id(alias))),
+                "{alias}"
+            );
+            assert_eq!(r.version, 3, "{alias}");
+        }
+    }
+
+    #[test]
+    fn a_stored_credential_issuer_alias_is_refused_on_load_too() {
+        let mut r = three_tier();
+        let alias = "https://issuer.example/tenant/";
+        let mut rec = record(alias, Role::Ti, &["MembershipCredential"], Some(TAO));
+        rec.updated_at = 1;
+        r.issuers.insert(alias.into(), rec);
+        assert_eq!(r.revalidated(), Err(RegistryError::InvalidId(alias.into())));
+
+        // Two spellings of one party in a file collapse and are refused.
+        let mut r = three_tier();
+        for id in ["https://issuer.example", "https://ISSUER.example"] {
+            r.issuers.insert(
+                id.into(),
+                record(id, Role::Ti, &["MembershipCredential"], Some(TAO)),
+            );
+        }
+        assert_eq!(
+            r.revalidated(),
+            Err(RegistryError::Duplicate("https://issuer.example".into()))
+        );
     }
 }
