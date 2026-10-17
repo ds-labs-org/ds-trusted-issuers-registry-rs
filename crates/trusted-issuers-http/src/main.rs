@@ -188,4 +188,15 @@ mod tests {
             assert!(did_from_host(bad).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn did_host_443_error_says_to_omit_the_port() {
+        let err = did_from_host("Localhost:443").unwrap_err();
+        assert!(err.contains("omit ':443'"), "{err}");
+        // Other bad hosts keep the general message.
+        for bad in ["localhost:08090", "a..b", "127.0.0.1"] {
+            let err = did_from_host(bad).unwrap_err();
+            assert!(!err.contains("443"), "{bad}: {err}");
+        }
+    }
 }

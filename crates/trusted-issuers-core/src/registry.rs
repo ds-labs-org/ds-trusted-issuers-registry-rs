@@ -1183,6 +1183,20 @@ mod tests {
     }
 
     #[test]
+    fn is_port_is_a_general_canonical_port_check() {
+        for valid in ["1", "80", "443", "8443", "65535"] {
+            assert!(is_port(valid), "{valid} should be a port");
+        }
+        for invalid in [
+            "", "0", "08443", "00", "65536", "99999", "+80", "-1", "8 0", "80a", "0x50", "８０",
+        ] {
+            assert!(!is_port(invalid), "{invalid} should not be a port");
+        }
+        // 443 is a port, but did:web has no second spelling of "no port".
+        assert!(!is_did("did:web:localhost%3A443"));
+    }
+
+    #[test]
     fn did_web_path_segments_have_one_spelling() {
         for valid in [
             "did:web:example.com:user:Alice",
