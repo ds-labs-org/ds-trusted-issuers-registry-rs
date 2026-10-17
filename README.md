@@ -65,7 +65,10 @@ A record's `did` must be a bare DID per DID Core syntax. DID URLs
 malformed `%` escapes are refused with 422. A `did:web` host must be a DNS
 name with an optional `%3A` and port, so that each party has one spelling:
 labels of `[A-Za-z0-9-]`, 1-63 characters, not starting or ending with
-`-`, no empty label or trailing dot (`example.com.`), and no IP address;
+`-`, no empty label or trailing dot (`example.com.`), and no IP address,
+which includes what URL parsing reads as one: a last label of only digits,
+or of `0x` and hex digits (`did:web:0x7f000001` and `did:web:0x7f.0x1` are
+fetched from 127.0.0.1, like `did:web:127.0.0.1`; `0xg.example` is a name);
 the port is 1-65535 without leading zeros (`%3A08443`) and is not 443
 (`did:web:host%3A443` fetches the same document as `did:web:host`, since
 did:web always uses https). Any other escape in the host
@@ -91,12 +94,14 @@ that collapses into another record makes startup fail with an error naming
 the DID; fix or remove it in the file before upgrading. Besides DID URLs
 (`#fragment`, `?query`), that covers `did:web` hosts that earlier versions
 accepted: escapes other than the port's `%3A` (`%2F`, `%40`, ...), `_`,
-empty or hyphen-edged labels, a trailing dot, IP addresses, and ports that
-are 0, above 65535, 443 or written with leading zeros, path segments that
-are empty (`host::alice`), `.` or `..`, or contain `%2F` or an escape of a
-letter, digit, `-`, `.` or `_` (`user%2Dx`), and a path that is just
-`.well-known`. `--did-host` likewise refuses an IP address, port 443 (leave
-it out: did:web already uses https) or a port with leading zeros.
+empty or hyphen-edged labels, a trailing dot, IP addresses (also those
+written with a last label of `0x` and hex digits, such as `0x7f000001` or
+`example.0x10`), and ports that are 0, above 65535, 443 or written with
+leading zeros, path segments that are empty (`host::alice`), `.` or `..`, or
+contain `%2F` or an escape of a letter, digit, `-`, `.` or `_` (`user%2Dx`),
+and a path that is just `.well-known`. `--did-host` likewise refuses an IP
+address (in either form), port 443 (leave it out: did:web already uses
+https) or a port with leading zeros.
 
 ## API
 

@@ -543,7 +543,14 @@ fn is_did_web_path_segment(segment: &str) -> bool {
 /// Empty labels are refused, including the trailing root dot: `example.com.`
 /// resolves like `example.com`, so accepting it would let one party be
 /// listed twice. The did:web method forbids IP addresses, so a name whose
-/// last label is all digits is refused too.
+/// last label URL parsing reads as a number is refused too. That is the
+/// WHATWG "ends in a number" check, which the `url` crate under the resolver
+/// applies: a last label of only digits (`127.0.0.1`, `example.123`), or of
+/// `0x` or `0X` and nothing but hex digits, none included (`0x7f000001`,
+/// `0x7f.0x1`, `0x`). Each such host is an IPv4 address to the resolver, or
+/// one it refuses, so `did:web:0x7f000001` and `did:web:0x7f.0x1` would be
+/// two more spellings of the IP address `127.0.0.1`. Only the last label
+/// counts: `0xg.example` and `a.0x1b.example` are names.
 pub fn is_dns_name(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     host.len() <= 253
@@ -556,9 +563,18 @@ pub fn is_dns_name(host: &str) -> bool {
                 && !label.starts_with('-')
                 && !label.ends_with('-')
         })
-        && labels
-            .last()
-            .is_some_and(|last| !last.bytes().all(|c| c.is_ascii_digit()))
+        && labels.last().is_some_and(|last| !is_ipv4_number(last))
+}
+
+/// Whether URL parsing reads `label`, the last label of a host, as an IPv4
+/// number: ASCII digits only, or `0x`/`0X` followed by hex digits only (or by
+/// nothing, which is 0). Assumes `label` is not empty.
+fn is_ipv4_number(label: &str) -> bool {
+    label.bytes().all(|c| c.is_ascii_digit())
+        || label
+            .strip_prefix("0x")
+            .or_else(|| label.strip_prefix("0X"))
+            .is_some_and(|hex| hex.bytes().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Whether `port` is a TCP port written one way only: decimal digits, no

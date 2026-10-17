@@ -228,9 +228,13 @@ mod tests {
         let err = did_from_host("Localhost:443").unwrap_err();
         assert!(err.contains("omit ':443'"), "{err}");
         // Other bad hosts keep the general message.
-        for bad in ["localhost:08090", "a..b", "127.0.0.1", "0x7f000001:443"] {
+        for bad in ["localhost:08090", "a..b", "127.0.0.1"] {
             let err = did_from_host(bad).unwrap_err();
             assert!(!err.contains("443"), "{bad}: {err}");
         }
+        // Not a name, so there is no port to omit; the message echoes the
+        // host, which is why this checks the advice and not for "443".
+        let err = did_from_host("0x7f000001:443").unwrap_err();
+        assert!(!err.contains("omit"), "{err}");
     }
 }
