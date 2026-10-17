@@ -55,19 +55,37 @@ canonical form: the DNS host is lowercased and the hex digits of
 percent-escapes are uppercased (`did:web:Host.example%3a8443` is
 `did:web:host.example%3A8443`; path segments keep their case). It applies
 to `did` and `accreditedBy` on write and to the DID in every read, check
-and status change, so a record
-matches however a credential spells its issuer. Other DID methods are
-compared as given. Two records that collapse to the same DID in a loaded
-data file or snapshot are refused as duplicates.
+and status change, so a record matches however a credential spells its
+issuer. Other DID methods are compared as given. Two records that collapse
+to the same DID in a loaded data file or snapshot are refused as
+duplicates.
 
 A record's `did` must be a bare DID per DID Core syntax. DID URLs
 (with a `#fragment`, `?query` or `/path`), spaces, a trailing `:` and
 malformed `%` escapes are refused with 422. A `did:web` host must be a DNS
 name with an optional `%3A` and port, so that each party has one spelling:
 labels of `[A-Za-z0-9-]`, 1-63 characters, not starting or ending with
-`-`, no empty label or trailing dot (`example.com.`), and no IP address;
-the port is 1-65535 without leading zeros (`%3A08443`). Any other escape
-in the host (`did:web:example.com%2FAlice`) is refused too. `--did-host`
+`-`, no empty label or trailing dot (`example.com.`), and no IP address,
+which includes what URL parsing reads as one: a last label of only digits,
+or of `0x` and hex digits (`did:web:0x7f000001` and `did:web:0x7f.0x1` are
+fetched from 127.0.0.1, like `did:web:127.0.0.1`; `0xg.example` is a name);
+the port is 1-65535 without leading zeros (`%3A08443`) and is not 443
+(`did:web:host%3A443` fetches the same document as `did:web:host`, since
+did:web always uses https). Any other escape in the host
+(`did:web:example.com%2FAlice`) is refused too. One spelling covers path
+segments as well: one may not be `.` or `..` or escape a letter, digit,
+`-`, `.` or `_`. The resolver turns the DID into a URL and URL parsing
+removes dot segments, so `did:web:host:bob:..:alice` and
+`did:web:host:bob:%2E%2E:alice` fetch the document of `did:web:host:alice`;
+servers treat an escaped letter, digit, `-`, `.` or `_` as the plain
+character, so `did:web:host:%61lice` does too.
+A path may not be just `.well-known` either
+(`did:web:host:.well-known` fetches the document of `did:web:host`);
+`.well-known` with other segments is fine. A path segment may not be empty
+(`did:web:host::alice` aliases `did:web:host:alice` on servers that merge
+slashes) or contain `%2F` (a server that decodes it before removing dot
+segments serves another path's document for `did:web:host:bob%2F..%2Falice`).
+Escapes of other characters (`%3A`, `%7E`, ...) stay legal. `--did-host`
 applies the same rules to the registry's own DID.
 
 **Upgrading.** On startup, data files and snapshots are re-checked under
@@ -76,9 +94,14 @@ that collapses into another record makes startup fail with an error naming
 the DID; fix or remove it in the file before upgrading. Besides DID URLs
 (`#fragment`, `?query`), that covers `did:web` hosts that earlier versions
 accepted: escapes other than the port's `%3A` (`%2F`, `%40`, ...), `_`,
-empty or hyphen-edged labels, a trailing dot, IP addresses, and ports that
-are 0, above 65535 or written with leading zeros. `--did-host` likewise
-refuses an IP address or a port with leading zeros.
+empty or hyphen-edged labels, a trailing dot, IP addresses (also those
+written with a last label of `0x` and hex digits, such as `0x7f000001` or
+`example.0x10`), and ports that are 0, above 65535, 443 or written with
+leading zeros, path segments that are empty (`host::alice`), `.` or `..`, or
+contain `%2F` or an escape of a letter, digit, `-`, `.` or `_` (`user%2Dx`),
+and a path that is just `.well-known`. `--did-host` likewise refuses an IP
+address (in either form), port 443 (leave it out: did:web already uses
+https) or a port with leading zeros.
 
 ## API
 

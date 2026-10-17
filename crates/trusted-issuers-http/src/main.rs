@@ -6,7 +6,7 @@ use clap::Parser;
 use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
-use trusted_issuers_core::{is_dns_name, is_port};
+use trusted_issuers_core::{is_did_web_port, is_dns_name};
 use trusted_issuers_http::{AppState, load, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
@@ -54,16 +54,23 @@ struct Cli {
 }
 
 /// `host` or `host:port`, lowercased, checked with the same
-/// [`is_dns_name`]/[`is_port`] rules the registry applies to every did:web
-/// it stores. Anything else would produce a `did:web` nobody can resolve,
-/// or the registry itself would refuse, so it is refused at startup.
+/// [`is_dns_name`]/[`is_did_web_port`] rules the registry applies to every
+/// did:web it stores. Anything else would produce a `did:web` nobody can
+/// resolve, or the registry itself would refuse, so it is refused at
+/// startup. Port 443 gets its own message: it is a valid port, but did:web
+/// always uses https, so the operator has to leave it out.
 fn did_from_host(host: &str) -> Result<String, String> {
     let host = host.trim().to_ascii_lowercase();
     let (name, port) = match host.rsplit_once(':') {
         Some((name, port)) => (name, Some(port)),
         None => (host.as_str(), None),
     };
-    if !is_dns_name(name) || !port.is_none_or(is_port) {
+    if is_dns_name(name) && port == Some("443") {
+        return Err(format!(
+            "--did-host '{host}' names port 443, but did:web always uses https, whose default port is 443: omit ':443' (--did-host {name})"
+        ));
+    }
+    if !is_dns_name(name) || !port.is_none_or(is_did_web_port) {
         return Err(format!(
             "--did-host '{host}' must be a host name with an optional port, e.g. registry.example or localhost:8090"
         ));
@@ -163,6 +170,10 @@ mod tests {
             did_from_host("localhost:8090").unwrap(),
             "did:web:localhost%3A8090"
         );
+        assert_eq!(
+            did_from_host("registry.example:4430").unwrap(),
+            "did:web:registry.example%3A4430"
+        );
         for bad in [
             "",
             "https://registry.example",
@@ -174,11 +185,56 @@ mod tests {
             "a..b",
             // A leading zero would spell the same port a second way.
             "localhost:08090",
+            // did:web uses https, so `:443` is the same URL as no port.
+            "localhost:443",
+            "registry.example:443",
             // did:web DIDs must not be IP addresses.
             "127.0.0.1",
             "127.0.0.1:8090",
         ] {
             assert!(did_from_host(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn did_host_refuses_what_url_parsing_reads_as_ipv4() {
+        // url reads a last label of `0x` and hex digits as a number, so each
+        // of these is 127.0.0.1 (or refused by url) and is no more a name
+        // than `127.0.0.1` is.
+        for bad in [
+            "0x7f000001",
+            "0X7F000001",
+            "0x7f.0x1",
+            "0x7f.0.0.0x1",
+            "0x7f000001:8090",
+            "0x",
+            "example.0x10",
+        ] {
+            assert!(did_from_host(bad).is_err(), "{bad}");
+        }
+        // Names that merely contain `0x` stay names.
+        assert_eq!(
+            did_from_host("0xg.Example:8090").unwrap(),
+            "did:web:0xg.example%3A8090"
+        );
+        assert_eq!(
+            did_from_host("a.0x1b.example").unwrap(),
+            "did:web:a.0x1b.example"
+        );
+    }
+
+    #[test]
+    fn did_host_443_error_says_to_omit_the_port() {
+        let err = did_from_host("Localhost:443").unwrap_err();
+        assert!(err.contains("omit ':443'"), "{err}");
+        // Other bad hosts keep the general message.
+        for bad in ["localhost:08090", "a..b", "127.0.0.1"] {
+            let err = did_from_host(bad).unwrap_err();
+            assert!(!err.contains("443"), "{bad}: {err}");
+        }
+        // Not a name, so there is no port to omit; the message echoes the
+        // host, which is why this checks the advice and not for "443".
+        let err = did_from_host("0x7f000001:443").unwrap_err();
+        assert!(!err.contains("omit"), "{err}");
     }
 }
