@@ -373,10 +373,12 @@ impl Registry {
 /// lookup with any other escape there (`%2F`, `%40`, `%3F`, `%23`, `%2E`)
 /// can't equal a stored DID, whatever the case of the text after it. The case
 /// is kept so that the DID echoed back for such a lookup (in a
-/// [`TrustDecision`]'s chain or in an error) is the one that was asked for,
-/// and so the rule stays right if `is_did` ever admits such an escape: a
-/// resolver that decodes `%2F`, `%40`, `%3F` or `%23` turns the text after it
-/// into a case-sensitive path, userinfo or query.
+/// [`TrustDecision`]'s chain or in an error) is the canonical form of the one
+/// that was asked for (host lowercased, hex digits uppercased, nothing else
+/// changed) and not one whose text after the escape was folded too, and so the
+/// rule stays right if `is_did` ever admits such an escape: a resolver that
+/// decodes `%2F`, `%40`, `%3F` or `%23` turns the text after it into a
+/// case-sensitive path, userinfo or query.
 ///
 /// Other methods define their own equivalence, so they are returned
 /// unchanged.
@@ -493,14 +495,17 @@ fn is_did_web_host(segment: &str) -> bool {
 
 /// Whether a `did:web` path segment names its directory one way only.
 ///
-/// The resolver joins the path segments with `/` into a URL, and URL parsing
-/// removes the dot segments `.` and `..` and treats an escaped unreserved
-/// character as the character itself (RFC 3986 section 6.2.2.2). So
-/// `did:web:host:.:alice`, `did:web:host:bob:..:alice`,
-/// `did:web:host:bob:%2E%2E:alice` and `did:web:host:%61lice` all fetch the
-/// document of `did:web:host:alice`, and [`canonical_did`] doesn't decode
-/// escapes to merge them. Such a DID is refused instead of stored as a
-/// second record for the same party, or one that reads as another tenant.
+/// The resolver joins the path segments with `/` into a URL. URL parsing
+/// removes the dot segments `.` and `..`, also written with `%2E`, so
+/// `did:web:host:.:alice`, `did:web:host:bob:..:alice` and
+/// `did:web:host:bob:%2E%2E:alice` are fetched as `did:web:host:alice`. It
+/// keeps every other escape as written, but a server applies RFC 3986
+/// normalization (section 6.2.2.2) and treats an escaped unreserved
+/// character as the character itself, so it serves the document of
+/// `did:web:host:alice` for `did:web:host:%61lice` too. [`canonical_did`]
+/// doesn't decode escapes to merge any of these. Such a DID is refused
+/// instead of stored as a second record for the same party, or one that
+/// reads as another tenant.
 ///
 /// A segment is refused when it is empty, `.` or `..`, or holds an escape of
 /// an ALPHA, DIGIT, `-`, `.` or `_`, or of `/` (`%2F`, either case).
@@ -927,11 +932,13 @@ mod tests {
         // `%2F`, `%40`, `%3F`, `%23` in the host segment decode to a path,
         // userinfo or query, which are case-sensitive. is_did refuses them
         // on write, so no lookup's result depends on the case after them.
-        // It is kept so the DID echoed back is the one asked for, and so the
-        // rule stays right if is_did ever admits such an escape. Only
-        // canonical_did's own output (and the DID echoed in an InvalidDid)
-        // shows it, so this test pins it. That escapes are never decoded
-        // or dropped is pinned by
+        // It is kept so the DID echoed back is the canonical form of the one
+        // asked for, and so the rule stays right if is_did ever admits such
+        // an escape. Only canonical_did's own output (and the DID echoed in
+        // an InvalidDid) shows it, so this test pins it. That a lookup is
+        // echoed in canonical form is pinned by
+        // an_unlisted_lookup_is_echoed_in_canonical_form, and that escapes
+        // are never decoded or dropped by
         // a_lookup_with_an_escaped_host_never_matches_a_stored_host.
         for (a, b) in [
             ("did:web:example.com%2FAlice", "did:web:example.com%2Falice"),

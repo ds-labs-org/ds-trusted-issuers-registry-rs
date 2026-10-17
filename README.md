@@ -71,9 +71,11 @@ the port is 1-65535 without leading zeros (`%3A08443`) and is not 443
 did:web always uses https). Any other escape in the host
 (`did:web:example.com%2FAlice`) is refused too. One spelling covers path
 segments as well: one may not be `.` or `..` or escape a letter, digit,
-`-`, `.` or `_`, because the resolver turns the DID into a URL and
-`did:web:host:bob:..:alice`, `did:web:host:bob:%2E%2E:alice` and
-`did:web:host:%61lice` all fetch the document of `did:web:host:alice`.
+`-`, `.` or `_`. The resolver turns the DID into a URL and URL parsing
+removes dot segments, so `did:web:host:bob:..:alice` and
+`did:web:host:bob:%2E%2E:alice` fetch the document of `did:web:host:alice`;
+servers treat an escaped letter, digit, `-`, `.` or `_` as the plain
+character, so `did:web:host:%61lice` does too.
 A path may not be just `.well-known` either
 (`did:web:host:.well-known` fetches the document of `did:web:host`);
 `.well-known` with other segments is fine. A path segment may not be empty
