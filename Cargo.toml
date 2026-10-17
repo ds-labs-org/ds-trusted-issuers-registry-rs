@@ -3,7 +3,24 @@ resolver = "2"
 members = [
     "crates/trusted-issuers-core",
     "crates/trusted-issuers-http",
+    "crates/trusted-issuers-graph",
+    "crates/trusted-issuers-contreforts",
+    "vendor/contreforts-core",
 ]
+
+# vendor/contreforts-core's own Cargo.toml inherits `version`/`edition` via
+# `.workspace = true`: it is designed to be vendored as a workspace member of
+# a consuming project, exactly as ds-identity-hub-rs and ds-sql-dps-rs do
+# with the same submodule at the same commit.
+
+# RocksDB (under oxigraph's `rocksdb` feature) is a large C++ build; with
+# debug info each build of it takes ~1.8 GB of target/. Nobody steps through
+# RocksDB, so build it (and the other C/C++ sys crates) without.
+[profile.dev.package.oxrocksdb-sys]
+debug = false
+
+[profile.dev.package.ring]
+debug = false
 
 [workspace.package]
 version = "0.1.0"
@@ -26,3 +43,29 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 clap = { version = "4", features = ["derive", "env"] }
+# X.509 chain validation for trust anchors (network-free; ring backend).
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "alloc", "std"] }
+rustls-pki-types = "1"
+base64 = "0.22"
+# Reads a leaf certificate's extended key usages (webpki does not expose
+# them); shares der/const-oid with the p256 stack.
+x509-cert = { version = "0.2", default-features = false }
+# Test PKIs (CA, intermediate, leaves) for the X.509 trust anchor tests.
+rcgen = "0.14"
+# SHA-256 for the audit log's hash chain; the same 0.10 line p256 uses.
+sha2 = "0.10"
+# Random credential ids (`urn:uuid:`) for accreditation VCs.
+uuid = { version = "1", features = ["v4"] }
+
+# Contreforts-backed storage (crates/trusted-issuers-graph,
+# crates/trusted-issuers-contreforts), on the same Oxigraph line as
+# ds-identity-hub-rs. Unlike the hub's in-memory graph, the registry's store
+# of record must survive restarts, so the `rocksdb` feature (on-disk store,
+# a C++ build of RocksDB) is enabled.
+oxigraph = { version = "0.5", default-features = false, features = ["rocksdb"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+# Required only because vendor/contreforts-core inherits these via
+# `.workspace = true`; not used directly by this project's own crates.
+dirs = "5"
+urlencoding = "2"

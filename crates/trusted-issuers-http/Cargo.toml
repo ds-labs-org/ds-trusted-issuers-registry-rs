@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 trusted-issuers-core = { path = "../trusted-issuers-core" }
+trusted-issuers-graph = { path = "../trusted-issuers-graph" }
+trusted-issuers-contreforts = { path = "../trusted-issuers-contreforts" }
+contreforts-core = { path = "../../vendor/contreforts-core" }
 ds-dcp-core-rs = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -25,5 +28,8 @@ p256 = { workspace = true }
 clap = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
+base64 = { workspace = true }
 tower = { workspace = true }
 http-body-util = "0.1"
+tempfile = "3"

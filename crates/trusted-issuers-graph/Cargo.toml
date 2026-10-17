@@ -1,0 +1,25 @@
+[package]
+name = "trusted-issuers-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Embedded Oxigraph RDF store for the trusted issuers registry: issuer records and the audit log as real, SPARQL-addressable triples, durable on disk, reachable through Contreforts' connector interface via trusted-issuers-contreforts."
+
+[dependencies]
+trusted-issuers-core = { path = "../trusted-issuers-core" }
+oxigraph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# oxigraph's SPARQL engine (spareval) accepts sha2 0.10 or 0.11 but only
+# compiles against 0.11 (digest 0.11, like its md-5/sha1). Cargo would unify
+# it onto the 0.10 that p256 pins, so Cargo.lock points spareval at sha2
+# 0.11 explicitly (as ds-identity-hub-rs's lock does); keep that line when
+# updating the lock.
+
+[dev-dependencies]
+rcgen = { workspace = true }
+base64 = { workspace = true }
+tempfile = "3"

@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use contreforts_core::{ContrefortsConnector, EntityKind};
 use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
-use trusted_issuers_core::{is_did_web_port, is_dns_name};
-use trusted_issuers_http::{AppState, load, router};
+use trusted_issuers_contreforts::{ISSUER_RECORD_KIND, RegistryGraphConnector};
+use trusted_issuers_core::{PostalAddress, is_did_web_port, is_dns_name};
+use trusted_issuers_http::{AppState, GraphStore, JsonFileStore, MemoryStore, Store, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
 /// this dataspace.
@@ -31,15 +33,28 @@ struct Cli {
     #[arg(long)]
     signing_key_file: Option<PathBuf>,
 
-    /// JSON file the registry is loaded from and saved to after each write.
-    /// Without it the registry lives in memory only.
-    #[arg(long)]
+    /// JSON file the registry is loaded from and saved to after each write,
+    /// with its audit log next to it (`<file>.audit.jsonl`). Without it (or
+    /// `--graph-dir`) the registry lives in memory only.
+    #[arg(long, conflicts_with = "graph_dir")]
     data_file: Option<PathBuf>,
+
+    /// Directory of the registry graph: records and audit log as RDF in an
+    /// on-disk Oxigraph store, reachable through Contreforts' connector
+    /// interface (created if missing).
+    #[arg(long)]
+    graph_dir: Option<PathBuf>,
+
+    /// Move the registry in this JSON data file into `--graph-dir`, which
+    /// must not hold a registry yet. A one-time migration from
+    /// `--data-file`; its audit log is not carried over.
+    #[arg(long, requires = "graph_dir")]
+    import_data_file: Option<PathBuf>,
 
     /// Start with an empty registry when `--data-file` doesn't exist yet.
     /// Without it a missing file is a startup error, so an unmounted volume
     /// can't silently serve an empty list.
-    #[arg(long)]
+    #[arg(long, requires = "data_file")]
     create_data_file: bool,
 
     /// Bearer token for the admin (write) API. Without it the admin API is
@@ -47,6 +62,54 @@ struct Cli {
     /// token stays out of process listings.
     #[arg(long, env = "TRUSTED_ISSUERS_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+
+    /// Request header the gateway sets to the authenticated person behind
+    /// an admin write (e.g. `X-Forwarded-User`), recorded as the actor in
+    /// the audit log. Without it every write is recorded as `admin`. Only
+    /// set it when nothing but the gateway can reach the admin API.
+    #[arg(long, value_parser = parse_header_name)]
+    audit_actor_header: Option<String>,
+
+    /// `SchemeOperatorName` of the published LoTE (`GET /v1/lote`).
+    #[arg(long, default_value = "Dataspace authority")]
+    lote_operator_name: String,
+
+    /// Street of the LoTE scheme operator's postal address. ETSI TS 119 602
+    /// requires one, so `GET /v1/lote` answers 503 until the street, the
+    /// locality and the country are all given.
+    #[arg(long, requires_all = ["lote_operator_locality", "lote_operator_country"])]
+    lote_operator_street: Option<String>,
+
+    /// Locality (city) of the LoTE scheme operator's postal address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_locality: Option<String>,
+
+    /// Postal code of the LoTE scheme operator's postal address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_postal_code: Option<String>,
+
+    /// State, province or region of the LoTE scheme operator's postal
+    /// address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_region: Option<String>,
+
+    /// Country (ISO 3166-1 alpha-2) of the LoTE scheme operator's postal
+    /// address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_country: Option<String>,
+
+    /// `LoTEType` URI of the published LoTE.
+    #[arg(long, default_value = trusted_issuers_core::DEFAULT_LOTE_TYPE)]
+    lote_type: String,
+
+    /// `SchemeTerritory` of the published LoTE (ISO 3166-1 alpha-2, or EU).
+    #[arg(long)]
+    lote_territory: Option<String>,
+
+    /// Public base URL of the registry API, for the LoTE's addresses and
+    /// distribution point. Defaults to the https origin of its did:web.
+    #[arg(long)]
+    public_base_url: Option<String>,
 
     /// How long a signed snapshot stays valid, in seconds.
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
@@ -81,6 +144,12 @@ fn did_from_host(host: &str) -> Result<String, String> {
     })
 }
 
+fn parse_header_name(name: &str) -> Result<String, String> {
+    axum::http::HeaderName::try_from(name)
+        .map(|_| name.to_string())
+        .map_err(|_| format!("'{name}' is not a valid HTTP header name"))
+}
+
 fn key_pair(did: String, signing_key: SigningKey) -> DcpKeyPair {
     let point = VerifyingKey::from(&signing_key).to_encoded_point(false);
     DcpKeyPair {
@@ -94,6 +163,29 @@ fn key_pair(did: String, signing_key: SigningKey) -> DcpKeyPair {
     }
 }
 
+/// The LoTE operator's postal address from the `--lote-operator-*` flags,
+/// `None` when none is given, checked like any party's address.
+fn operator_address(cli: &Cli) -> Result<Option<PostalAddress>, String> {
+    let (Some(street), Some(locality), Some(country)) = (
+        &cli.lote_operator_street,
+        &cli.lote_operator_locality,
+        &cli.lote_operator_country,
+    ) else {
+        return Ok(None);
+    };
+    let address = PostalAddress {
+        street_address: street.clone(),
+        locality: locality.clone(),
+        postal_code: cli.lote_operator_postal_code.clone(),
+        state_or_province: cli.lote_operator_region.clone(),
+        country: country.clone(),
+    };
+    match address.problem() {
+        Some(problem) => Err(format!("LoTE operator address: {problem}")),
+        None => Ok(Some(address)),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     tracing_subscriber::fmt()
@@ -102,6 +194,8 @@ async fn main() -> Result<(), String> {
         )
         .init();
     let cli = Cli::parse();
+    // Checked before anything is opened, so a bad address fails fast.
+    let operator_address = operator_address(&cli)?;
 
     let did = did_from_host(&cli.did_host)?;
     let key = match &cli.signing_key_file {
@@ -123,10 +217,29 @@ async fn main() -> Result<(), String> {
         }
     };
 
-    let registry: trusted_issuers_core::Registry = match &cli.data_file {
-        Some(path) => load(path, cli.create_data_file)?,
-        None => Default::default(),
-    };
+    let (store, registry): (Arc<dyn Store>, trusted_issuers_core::Registry) =
+        match (&cli.graph_dir, &cli.data_file) {
+            (Some(dir), _) => {
+                let (store, registry) = GraphStore::open(dir, cli.import_data_file.as_deref())?;
+                // Proves the Contreforts round trip over the graph the admin
+                // API writes into, as ds-identity-hub-rs does at startup.
+                let records = RegistryGraphConnector::new(store.graph())
+                    .pull(EntityKind::new(ISSUER_RECORD_KIND), None)
+                    .await
+                    .map_err(|e| format!("contreforts round trip: {e}"))?;
+                tracing::info!(
+                    graph = %dir.display(),
+                    records = records.len(),
+                    "registry graph open, reachable through the Contreforts connector"
+                );
+                (Arc::new(store), registry)
+            }
+            (None, Some(path)) => {
+                let (store, registry) = JsonFileStore::open(path, cli.create_data_file)?;
+                (Arc::new(store), registry)
+            }
+            (None, None) => (Arc::new(MemoryStore::new()), Default::default()),
+        };
     tracing::info!(
         did = %key.own_did,
         issuers = registry.issuers.len(),
@@ -135,13 +248,29 @@ async fn main() -> Result<(), String> {
         cli.bind
     );
 
-    let state = Arc::new(AppState::new(
-        registry,
-        key,
-        cli.admin_token,
-        cli.data_file,
-        cli.snapshot_ttl_secs,
-    ));
+    let mut state = AppState::new(registry, key, cli.admin_token, store, cli.snapshot_ttl_secs);
+    if let Some(name) = &cli.audit_actor_header {
+        state = state.with_audit_actor_header(name);
+    }
+    let base_url = cli
+        .public_base_url
+        .clone()
+        .unwrap_or_else(|| trusted_issuers_http::base_url_of(&state.key.own_did));
+    match operator_address {
+        Some(operator_address) => {
+            state = state.with_lote(trusted_issuers_core::LoteOptions {
+                operator_name: cli.lote_operator_name.clone(),
+                operator_address,
+                base_url,
+                lote_type: cli.lote_type.clone(),
+                territory: cli.lote_territory.clone(),
+            });
+        }
+        None => tracing::warn!(
+            "no LoTE operator address configured (--lote-operator-street, -locality, -country): GET /v1/lote is disabled"
+        ),
+    }
+    let state = Arc::new(state);
     if !state.admin_enabled() {
         tracing::warn!("no (or an empty) admin token configured: the admin API is disabled");
     }
@@ -159,6 +288,23 @@ async fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::did_from_host;
+
+    #[test]
+    fn the_lote_base_url_is_the_did_web_origin() {
+        use trusted_issuers_http::base_url_of;
+        assert_eq!(
+            base_url_of("did:web:registry.example"),
+            "https://registry.example"
+        );
+        assert_eq!(
+            base_url_of("did:web:localhost%3A8090"),
+            "https://localhost:8090"
+        );
+        assert_eq!(
+            base_url_of("did:web:host.example:tir"),
+            "https://host.example/tir"
+        );
+    }
 
     #[test]
     fn did_host_is_validated() {
@@ -236,5 +382,44 @@ mod tests {
         // host, which is why this checks the advice and not for "443".
         let err = did_from_host("0x7f000001:443").unwrap_err();
         assert!(!err.contains("omit"), "{err}");
+    }
+
+    #[test]
+    fn the_lote_operator_address_comes_from_its_flags() {
+        use super::{Cli, operator_address};
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let args = ["registry", "--did-host", "registry.example"];
+            Cli::try_parse_from(args.iter().chain(extra))
+        };
+        assert_eq!(operator_address(&parse(&[]).unwrap()), Ok(None));
+        let cli = parse(&[
+            "--lote-operator-street",
+            "Rue de la Loi 200",
+            "--lote-operator-locality",
+            "Brussels",
+            "--lote-operator-postal-code",
+            "1049",
+            "--lote-operator-country",
+            "BE",
+        ])
+        .unwrap();
+        let address = operator_address(&cli).unwrap().unwrap();
+        assert_eq!(address.locality, "Brussels");
+        assert_eq!(address.postal_code.as_deref(), Some("1049"));
+        // Street, locality and country go together.
+        assert!(parse(&["--lote-operator-street", "Rue de la Loi 200"]).is_err());
+        assert!(parse(&["--lote-operator-country", "BE"]).is_err());
+        let cli = parse(&[
+            "--lote-operator-street",
+            "Rue de la Loi 200",
+            "--lote-operator-locality",
+            "Brussels",
+            "--lote-operator-country",
+            "Belgium",
+        ])
+        .unwrap();
+        let err = operator_address(&cli).unwrap_err();
+        assert!(err.contains("ISO 3166-1"), "{err}");
     }
 }
