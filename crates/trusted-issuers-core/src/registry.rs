@@ -1088,6 +1088,10 @@ mod tests {
             "did:web:localhost%3a8443",
             "did:web:localhost%3A1",
             "did:web:localhost%3A65535",
+            // Only exactly 443 is the https default.
+            "did:web:localhost%3A44",
+            "did:web:localhost%3A80",
+            "did:web:localhost%3A4430",
             "did:web:example.com:user%2Dx:Alice",
         ] {
             assert!(is_did(valid), "{valid} should be valid");
@@ -1110,6 +1114,12 @@ mod tests {
             "did:web:localhost%3A65536",
             "did:web:localhost%3A99999",
             "did:web:localhost%3A123456789012345678901234567890",
+            // did:web always uses https, whose default port is 443, so
+            // `host%3A443` fetches the same document as `host`: a second
+            // spelling of the same party.
+            "did:web:localhost%3A443",
+            "did:web:localhost%3a443",
+            "did:web:localhost%3A443:user:Alice",
             // Not DNS host characters.
             "did:web:a_b.example",
         ] {
@@ -1162,6 +1172,7 @@ mod tests {
                 "did:web:tenant.example%3A08443",
             ),
             ("did:web:other.example", "did:web:other.example."),
+            ("did:web:default.example", "did:web:default.example%3A443"),
         ] {
             r.upsert(
                 record(first, Role::Ti, &["MembershipCredential"], Some(TAO)),
@@ -1176,7 +1187,23 @@ mod tests {
                 Err(RegistryError::InvalidDid(second.into()))
             );
         }
-        assert_eq!(r.issuers.len(), 5);
+        assert_eq!(r.issuers.len(), 6);
+    }
+
+    #[test]
+    fn a_stored_default_port_is_refused_on_load_too() {
+        // Data written before `host%3A443` was refused must fail startup
+        // instead of listing the same party under two spellings.
+        let mut loose = three_tier();
+        let mut ti = loose.issuers.remove(TI).unwrap();
+        ti.did = "did:web:issuer.example%3A443".into();
+        loose.issuers.insert(ti.did.clone(), ti);
+        assert_eq!(
+            loose.revalidated(),
+            Err(RegistryError::InvalidDid(
+                "did:web:issuer.example%3A443".into()
+            ))
+        );
     }
 
     #[test]

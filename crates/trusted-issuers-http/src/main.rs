@@ -163,6 +163,10 @@ mod tests {
             did_from_host("localhost:8090").unwrap(),
             "did:web:localhost%3A8090"
         );
+        assert_eq!(
+            did_from_host("registry.example:4430").unwrap(),
+            "did:web:registry.example%3A4430"
+        );
         for bad in [
             "",
             "https://registry.example",
@@ -174,6 +178,9 @@ mod tests {
             "a..b",
             // A leading zero would spell the same port a second way.
             "localhost:08090",
+            // did:web uses https, so `:443` is the same URL as no port.
+            "localhost:443",
+            "registry.example:443",
             // did:web DIDs must not be IP addresses.
             "127.0.0.1",
             "127.0.0.1:8090",
