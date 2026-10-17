@@ -26,3 +26,5 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 clap = { version = "4", features = ["derive", "env"] }
+# SHA-256 for the audit log's hash chain; the same 0.10 line p256 uses.
+sha2 = "0.10"

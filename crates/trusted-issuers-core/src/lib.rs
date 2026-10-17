@@ -3,10 +3,14 @@
 //! accreditation-chain trust check) and [`snapshot`] (the signed,
 //! offline-cacheable trust list).
 
+pub mod audit;
 pub mod model;
 pub mod registry;
 pub mod snapshot;
 
+pub use audit::{
+    AuditAction, AuditEntry, AuditError, AuditRecord, GENESIS_HASH, verify_audit_chain,
+};
 pub use model::{ANY_CREDENTIAL_TYPE, IdKind, IssuerRecord, Role, Status};
 pub use registry::{
     MAX_CHAIN_DEPTH, Registry, RegistryError, TrustDecision, canonical_did, canonical_id,

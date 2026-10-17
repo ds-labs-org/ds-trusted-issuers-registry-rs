@@ -1590,6 +1590,7 @@ dependencies = [
  "p256",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
