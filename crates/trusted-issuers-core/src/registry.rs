@@ -365,12 +365,21 @@ impl Registry {
 /// issuer. So for `did:web` the DNS host (the first segment up to its first
 /// `%` escape) is lowercased and every percent-escape's hex digits are
 /// uppercased. Path segments keep their case, and so does anything after an
-/// escape in the first segment. [`is_did`] refuses every escape there except
-/// the port's `%3A`, so no stored DID has such text. But lookups take any
-/// string, and a resolver that decodes `%2F`, `%40`, `%3F` or `%23` would
-/// turn it into a case-sensitive path, userinfo or query. Keeping its case
-/// means such a lookup never lands on a listed host. Other methods define
-/// their own equivalence, so they are returned unchanged.
+/// escape in the first segment.
+///
+/// That last rule decides no match. `is_did` allows no escape in the first
+/// segment but the port's `%3A` followed by digits, and this function only
+/// changes letter case: it never decodes, adds or drops an escape. So a
+/// lookup with any other escape there (`%2F`, `%40`, `%3F`, `%23`, `%2E`)
+/// can't equal a stored DID, whatever the case of the text after it. The case
+/// is kept so that the DID echoed back for such a lookup (in a
+/// [`TrustDecision`]'s chain or in an error) is the one that was asked for,
+/// and so the rule stays right if `is_did` ever admits such an escape: a
+/// resolver that decodes `%2F`, `%40`, `%3F` or `%23` turns the text after it
+/// into a case-sensitive path, userinfo or query.
+///
+/// Other methods define their own equivalence, so they are returned
+/// unchanged.
 pub fn canonical_did(did: &str) -> String {
     let Some(rest) = did.strip_prefix("did:web:") else {
         return did.to_string();
@@ -850,8 +859,13 @@ mod tests {
     fn canonical_did_keeps_case_after_an_encoded_delimiter() {
         // `%2F`, `%40`, `%3F`, `%23` in the host segment decode to a path,
         // userinfo or query, which are case-sensitive. is_did refuses them
-        // on write, but a lookup spelled this way must not be folded into
-        // another spelling (see the escaped-host lookup test below).
+        // on write, so no lookup's result depends on the case after them.
+        // It is kept so the DID echoed back is the one asked for, and so the
+        // rule stays right if is_did ever admits such an escape. Only
+        // canonical_did's own output (and the DID echoed in an InvalidDid)
+        // shows it, so this test pins it. That escapes are never decoded
+        // or dropped is pinned by
+        // a_lookup_with_an_escaped_host_never_matches_a_stored_host.
         for (a, b) in [
             ("did:web:example.com%2FAlice", "did:web:example.com%2Falice"),
             ("did:web:example.com%40Bob", "did:web:example.com%40bob"),
