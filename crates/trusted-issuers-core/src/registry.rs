@@ -406,9 +406,41 @@ pub fn canonical_did(did: &str) -> String {
 }
 
 /// The canonical spelling of an issuer id, which is what the registry
-/// stores and looks up by: [`canonical_did`] for a DID.
+/// stores and looks up by: [`canonical_did`] for a DID, and for an https URL
+/// (an OID4VCI credential issuer identifier) the scheme and host lowercased
+/// and every percent-escape's hex digits uppercased.
+///
+/// Every URL parser treats the scheme and the DNS host as case-insensitive,
+/// and an escape's hex digits are too (RFC 3986, section 6.2.2.1), so
+/// `HTTPS://Issuer.example` names the same issuer as
+/// `https://issuer.example`. OID4VCI calls the identifier case sensitive,
+/// meaning the issuer's metadata must repeat it exactly; folding case here
+/// only stops the registry from listing one party twice or missing a listed
+/// one. The path keeps its case, and nothing is decoded, added or dropped,
+/// as in [`canonical_did`]: the other spellings that fetch the same metadata
+/// (`:443`, a trailing `/`, dot segments, ...) are refused at write instead.
+///
+/// The host is only lowercased when the authority holds nothing but host and
+/// port characters, so a lookup with userinfo (refused at write) is echoed
+/// with its case.
 pub fn canonical_id(id: &str) -> String {
-    canonical_did(id)
+    let Some(rest) = id
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &id[8..])
+    else {
+        return canonical_did(id);
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    let authority = if authority
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b':'))
+    {
+        authority.to_ascii_lowercase()
+    } else {
+        authority.to_string()
+    };
+    format!("https://{}", uppercase_escapes(&(authority + tail)))
 }
 
 /// Puts a record's id references in [`canonical_id`] form.
@@ -486,11 +518,16 @@ fn is_issuer_id(s: &str) -> bool {
 /// port number and path components, but no query or fragment components"
 /// (OpenID for Verifiable Credential Issuance 1.0, section 12.2.1).
 ///
-/// The host follows the did:web rules ([`is_dns_name`]): no IP address and
-/// no userinfo, so the party is always named by a DNS name. The port is an
-/// [`is_port`]. Path segments are made of unreserved characters (letters,
-/// digits, `-`, `.`, `_`, `~`) and percent-escapes of anything else, which
-/// leaves out what a URL parser rewrites (spaces, `\`, raw non-ASCII).
+/// Like a did:web, each party has one spelling, in [`canonical_id`] form
+/// (lowercase scheme and host). The host follows the did:web rules
+/// ([`is_dns_name`]): no IP address, no trailing dot and no userinfo, so the
+/// party is always named by a DNS name. The port is an [`is_port`] that is
+/// not 443, which https already implies. The path is empty or `/` and
+/// non-empty segments ([`is_url_path_segment`]), so it never ends in `/`:
+/// OID4VCI strips a trailing `/` before building the metadata URL
+/// (`/.well-known/openid-credential-issuer` + path), and URL parsers add one
+/// to a bare origin, so `https://issuer.example/` and
+/// `https://issuer.example` fetch the same metadata.
 pub fn is_credential_issuer_id(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("https://") else {
         return false;
@@ -501,22 +538,37 @@ pub fn is_credential_issuer_id(s: &str) -> bool {
         None => (authority, None),
     };
     is_dns_name(host)
-        && port.is_none_or(is_port)
+        && !host.bytes().any(|c| c.is_ascii_uppercase())
+        && port.is_none_or(|p| is_port(p) && p != "443")
         && path
             .strip_prefix('/')
             .is_none_or(|path| path.split('/').all(is_url_path_segment))
 }
 
 /// Whether `segment` is one segment of a credential issuer identifier's
-/// path: unreserved characters and well-formed percent-escapes only.
+/// path, written one way only: unreserved characters (letters, digits, `-`,
+/// `.`, `_`, `~`) and percent-escapes of anything else. That leaves out what
+/// a URL parser rewrites (spaces, `\`, raw non-ASCII) and reserved
+/// characters some servers give a meaning (`;` path parameters), which must
+/// be escaped.
+///
+/// The rest follows [`is_did_web_path_segment`], for the same reasons: an
+/// empty segment (`//`, which servers that merge slashes drop), `.` and `..`
+/// (which URL parsing removes), an escaped unreserved character (`%61`,
+/// `%2E`, `%7E`, which servers decode) and an escaped `/` (`%2F`, which
+/// hides a path separator) would each give a party a second spelling.
 fn is_url_path_segment(segment: &str) -> bool {
+    if matches!(segment, "" | "." | "..") {
+        return false;
+    }
     let bytes = segment.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'%' => {
-                if escaped_byte(&bytes[i..]).is_none() {
-                    return false;
+                match escaped_byte(&bytes[i..]) {
+                    Some(c) if c != b'/' && !is_unreserved(c) => {}
+                    _ => return false,
                 }
                 i += 3;
             }
