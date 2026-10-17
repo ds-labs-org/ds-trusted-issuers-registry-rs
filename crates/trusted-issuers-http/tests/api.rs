@@ -1341,3 +1341,55 @@ async fn an_issuer_downloads_accreditations_that_verify_offline() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
+
+#[tokio::test]
+async fn the_registry_is_published_as_a_signed_lote() {
+    let s = state(Some(TOKEN), None);
+    seed_with_oid4vci(&s).await;
+    let (status, lote, content_type) = call(&s, "GET", "/v1/lote", None, None).await;
+    assert_eq!(status, StatusCode::OK, "{lote}");
+    assert_eq!(content_type.as_deref(), Some("application/json"));
+    let info = &lote["LoTE"]["ListAndSchemeInformation"];
+    assert_eq!(info["LoTESequenceNumber"], 6);
+    // The registry's own did:web origin is the scheme's address.
+    assert_eq!(
+        info["DistributionPoints"],
+        json!(["https://registry.example/v1/lote"])
+    );
+    let entities = lote["LoTE"]["TrustedEntitiesList"].as_array().unwrap();
+    assert_eq!(entities.len(), 5);
+
+    let (status, token, content_type) = call(&s, "GET", "/v1/lote.jws", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type.as_deref(), Some("application/jose"));
+    let token = token.as_str().unwrap();
+    let (_, doc, _) = call(&s, "GET", "/.well-known/did.json", None, None).await;
+    let doc = serde_json::from_value(doc).unwrap();
+    let (_, header, payload) = dcp_core::decode_jws_unverified(token).unwrap();
+    assert_eq!(header["typ"], trusted_issuers_core::LOTE_TYP);
+    let key = find_verifying_key(&doc, header["kid"].as_str().unwrap()).unwrap();
+    dcp_core::verify_jws_signature(token, &key).unwrap();
+    assert_eq!(
+        payload["LoTE"]["TrustedEntitiesList"],
+        lote["LoTE"]["TrustedEntitiesList"]
+    );
+
+    // A suspension takes the party (and those it accredits) off the list.
+    let (status, _, _) = call(
+        &s,
+        "PATCH",
+        "/v1/issuers/did:web:pid-tao.example/status",
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, lote, _) = call(&s, "GET", "/v1/lote", None, None).await;
+    assert_eq!(
+        lote["LoTE"]["TrustedEntitiesList"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}

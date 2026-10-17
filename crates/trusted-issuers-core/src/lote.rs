@@ -141,6 +141,15 @@ pub fn build_lote(registry: &Registry, options: &LoteOptions, now: u64, ttl_secs
     }})
 }
 
+/// The LoTE document signed by the registry as a compact ES256 JWS
+/// (`typ` [`LOTE_TYP`], `kid` the registry's key), verifiable against the
+/// registry's DID document like the snapshot. Not a JAdES baseline
+/// signature: the registry signs with its DID key and has no X.509
+/// certificate to put in `x5c`.
+pub fn sign_lote(lote: &Value, key: &dcp_core::DcpKeyPair) -> String {
+    crate::snapshot::sign_with_typ(lote, key, LOTE_TYP)
+}
+
 /// Percent-encodes `s` as one URI path segment: everything but RFC 3986
 /// unreserved characters is escaped, so an id's `:`, `/` and `%` stay
 /// inside the segment (as the registry API expects).

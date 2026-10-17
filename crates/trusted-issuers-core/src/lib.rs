@@ -20,7 +20,7 @@ pub use audit::{
 };
 pub use lote::{
     DEFAULT_LOTE_TYPE, LOTE_TYP, LOTE_VERSION, LoteOptions, SERVICE_TYPE_ACCREDITATION,
-    SERVICE_TYPE_ISSUANCE, build_lote,
+    SERVICE_TYPE_ISSUANCE, build_lote, sign_lote,
 };
 pub use model::{ANY_CREDENTIAL_TYPE, IdKind, IssuerRecord, Role, Status};
 pub use registry::{
