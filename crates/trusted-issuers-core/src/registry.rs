@@ -470,8 +470,8 @@ fn is_did(s: &str) -> bool {
 }
 
 /// Whether a `did:web` first segment is `host` or `host%3Aport`, with the
-/// host an [`is_dns_name`] and the port an [`is_port`] (the same rules
-/// `--did-host` applies to the registry's own DID).
+/// host an [`is_dns_name`] and the port an [`is_did_web_port`] (the same
+/// rules `--did-host` applies to the registry's own DID).
 ///
 /// The did:web method only percent-encodes the `:` before a port. Any other
 /// escape (`%2F`, `%40`, `%2E`, ...) decodes to a path, userinfo or a
@@ -487,7 +487,7 @@ fn is_did_web_host(segment: &str) -> bool {
         && port.is_none_or(|p| {
             p.get(..3)
                 .is_some_and(|sep| sep.eq_ignore_ascii_case("%3A"))
-                && is_port(&p[3..])
+                && is_did_web_port(&p[3..])
         })
 }
 
@@ -556,17 +556,28 @@ pub fn is_dns_name(host: &str) -> bool {
             .is_some_and(|last| !last.bytes().all(|c| c.is_ascii_digit()))
 }
 
-/// Whether `port` is the port of a did:web host, written one way only:
-/// decimal digits, no leading zero, 1-65535, and not 443. `08443` is the
-/// same port as `8443`, and did:web always resolves over https, whose
-/// default port is 443, so `host:443` fetches the same document as `host`.
-/// Accepting either would give a did:web party a second spelling.
+/// Whether `port` is a TCP port written one way only: decimal digits, no
+/// leading zero, 1-65535. `08443` is the same port as `8443`, so accepting
+/// it would give a did:web party a second spelling.
+///
+/// This is a general check, so 443 is a port. did:web has a rule of its own
+/// on top of it, [`is_did_web_port`].
 pub fn is_port(port: &str) -> bool {
     !port.is_empty()
         && !port.starts_with('0')
-        && port != "443"
         && port.bytes().all(|c| c.is_ascii_digit())
         && port.parse::<u16>().is_ok()
+}
+
+/// Whether `port` may follow the host of a did:web: an [`is_port`] that is
+/// not 443. did:web always resolves over https, whose default port is 443, so
+/// `host%3A443` fetches the same document as `host`. Accepting it would give
+/// a did:web party a second spelling.
+///
+/// The registry applies it to the host of every did:web it stores, and the
+/// binary applies it to `--did-host`.
+pub fn is_did_web_port(port: &str) -> bool {
+    is_port(port) && port != "443"
 }
 
 /// [`is_did`]'s method-independent part: the DID Core ABNF.

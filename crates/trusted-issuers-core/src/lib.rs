@@ -9,7 +9,8 @@ pub mod snapshot;
 
 pub use model::{ANY_CREDENTIAL_TYPE, IssuerRecord, Role, Status};
 pub use registry::{
-    MAX_CHAIN_DEPTH, Registry, RegistryError, TrustDecision, canonical_did, is_dns_name, is_port,
+    MAX_CHAIN_DEPTH, Registry, RegistryError, TrustDecision, canonical_did, is_did_web_port,
+    is_dns_name, is_port,
 };
 pub use snapshot::{
     SNAPSHOT_CLOCK_SKEW_SECS, SNAPSHOT_TYP, SnapshotError, SnapshotPayload, TrustList,

@@ -6,7 +6,7 @@ use clap::Parser;
 use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
-use trusted_issuers_core::{is_dns_name, is_port};
+use trusted_issuers_core::{is_did_web_port, is_dns_name};
 use trusted_issuers_http::{AppState, load, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
@@ -54,16 +54,23 @@ struct Cli {
 }
 
 /// `host` or `host:port`, lowercased, checked with the same
-/// [`is_dns_name`]/[`is_port`] rules the registry applies to every did:web
-/// it stores. Anything else would produce a `did:web` nobody can resolve,
-/// or the registry itself would refuse, so it is refused at startup.
+/// [`is_dns_name`]/[`is_did_web_port`] rules the registry applies to every
+/// did:web it stores. Anything else would produce a `did:web` nobody can
+/// resolve, or the registry itself would refuse, so it is refused at
+/// startup. Port 443 gets its own message: it is a valid port, but did:web
+/// always uses https, so the operator has to leave it out.
 fn did_from_host(host: &str) -> Result<String, String> {
     let host = host.trim().to_ascii_lowercase();
     let (name, port) = match host.rsplit_once(':') {
         Some((name, port)) => (name, Some(port)),
         None => (host.as_str(), None),
     };
-    if !is_dns_name(name) || !port.is_none_or(is_port) {
+    if is_dns_name(name) && port == Some("443") {
+        return Err(format!(
+            "--did-host '{host}' names port 443, but did:web always uses https, whose default port is 443: omit ':443' (--did-host {name})"
+        ));
+    }
+    if !is_dns_name(name) || !port.is_none_or(is_did_web_port) {
         return Err(format!(
             "--did-host '{host}' must be a host name with an optional port, e.g. registry.example or localhost:8090"
         ));

@@ -93,8 +93,8 @@ empty or hyphen-edged labels, a trailing dot, IP addresses, and ports that
 are 0, above 65535, 443 or written with leading zeros, path segments that
 are empty (`host::alice`), `.` or `..`, or contain `%2F` or an escape of a
 letter, digit, `-`, `.` or `_` (`user%2Dx`), and a path that is just
-`.well-known`. `--did-host` likewise refuses an IP address, port 443 or a
-port with leading zeros.
+`.well-known`. `--did-host` likewise refuses an IP address, port 443 (leave
+it out: did:web already uses https) or a port with leading zeros.
 
 ## API
 
