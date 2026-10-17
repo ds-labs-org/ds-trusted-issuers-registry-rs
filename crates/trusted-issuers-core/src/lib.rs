@@ -1,7 +1,10 @@
 //! Trusted issuers registry domain, network-free so any verifier can embed
 //! it: [`model`] (records), [`registry`] (write rules and the
-//! accreditation-chain trust check) and [`snapshot`] (the signed,
-//! offline-cacheable trust list).
+//! accreditation-chain trust check), [`snapshot`] (the signed,
+//! offline-cacheable trust list), [`x509`] (X.509 trust anchors and
+//! certificate chain checks), [`accreditation`] (accreditations as
+//! verifiable credentials), [`lote`] (the ETSI TS 119 602 export) and
+//! [`audit`] (the hash-chained audit log).
 
 pub mod accreditation;
 pub mod audit;
