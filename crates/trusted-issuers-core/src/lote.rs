@@ -24,6 +24,7 @@
 
 use serde_json::{Value, json};
 
+use crate::model::IdKind;
 use crate::registry::Registry;
 
 /// `LoTEVersionIdentifier` of the lists produced here.
@@ -61,8 +62,98 @@ pub struct LoteOptions {
 
 /// The LoTE document for `registry` at `now`, next update after `ttl_secs`.
 pub fn build_lote(registry: &Registry, options: &LoteOptions, now: u64, ttl_secs: u64) -> Value {
-    let _ = (registry, options, now, ttl_secs);
-    json!({})
+    let base = options.base_url.trim_end_matches('/');
+    let en = |value: &str| json!([{"lang": "en", "value": value}]);
+    let uri = |value: &str| json!([{"lang": "en", "uriValue": value}]);
+    let mut info = json!({
+        "LoTEVersionIdentifier": LOTE_VERSION,
+        "LoTESequenceNumber": registry.version + 1,
+        "LoTEType": options.lote_type,
+        "SchemeOperatorName": en(&options.operator_name),
+        "SchemeOperatorAddress": {
+            "SchemeOperatorPostalAddress": [],
+            "SchemeOperatorElectronicAddress": uri(base),
+        },
+        "SchemeName": en(&format!("{}: trusted issuers", options.operator_name)),
+        "SchemeInformationURI": uri(base),
+        "ListIssueDateTime": crate::iso8601_utc(now),
+        "NextUpdate": crate::iso8601_utc(now.saturating_add(ttl_secs)),
+        "DistributionPoints": [format!("{base}/v1/lote")],
+    });
+    if let Some(territory) = &options.territory {
+        info["SchemeTerritory"] = json!(territory);
+    }
+    let entities: Vec<Value> = registry
+        .list()
+        .filter_map(|record| {
+            let trusted: Vec<&String> = record
+                .credential_types
+                .iter()
+                .filter(|t| registry.check(&record.id, t, now).trusted)
+                .collect();
+            if trusted.is_empty() {
+                return None;
+            }
+            let record_uri = format!("{base}/v1/issuers/{}", encode_component(&record.id));
+            let web_address = match IdKind::of(&record.id) {
+                IdKind::Url => record.id.clone(),
+                IdKind::Did => record_uri.clone(),
+            };
+            let service_type = if record.role.can_accredit() {
+                SERVICE_TYPE_ACCREDITATION
+            } else {
+                SERVICE_TYPE_ISSUANCE
+            };
+            let mut identity = json!({"OtherIds": [record.id]});
+            if !record.x509_certificates.is_empty() {
+                identity["X509Certificates"] = record
+                    .x509_certificates
+                    .iter()
+                    .map(|der| json!({"val": der}))
+                    .collect();
+            }
+            let services: Vec<Value> = trusted
+                .iter()
+                .map(|credential_type| {
+                    json!({"ServiceInformation": {
+                        "ServiceName": en(credential_type),
+                        "ServiceDigitalIdentity": identity,
+                        "ServiceTypeIdentifier": service_type,
+                    }})
+                })
+                .collect();
+            Some(json!({
+                "TrustedEntityInformation": {
+                    "TEName": en(record.name.as_deref().unwrap_or(&record.id)),
+                    "TEAddress": {
+                        "TEPostalAddress": [],
+                        "TEElectronicAddress": uri(&web_address),
+                    },
+                    "TEInformationURI": uri(&record_uri),
+                },
+                "TrustedEntityServices": services,
+            }))
+        })
+        .collect();
+    json!({"LoTE": {
+        "ListAndSchemeInformation": info,
+        "TrustedEntitiesList": entities,
+    }})
+}
+
+/// Percent-encodes `s` as one URI path segment: everything but RFC 3986
+/// unreserved characters is escaped, so an id's `:`, `/` and `%` stay
+/// inside the segment (as the registry API expects).
+fn encode_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
