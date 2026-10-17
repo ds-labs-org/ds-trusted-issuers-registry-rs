@@ -9,7 +9,7 @@
 //!
 //! ```json
 //! { "iss": "did:web:registry.example", "iat": 1760000000, "exp": 1760003600,
-//!   "version": 42, "issuers": [ { "did": "...", "role": "ti", ... } ] }
+//!   "version": 42, "issuers": [ { "id": "...", "role": "ti", ... } ] }
 //! ```
 
 use dcp_core::{DcpKeyPair, decode_jws_unverified, verify_jws_signature};

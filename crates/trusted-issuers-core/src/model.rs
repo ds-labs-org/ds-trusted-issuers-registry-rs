@@ -4,6 +4,11 @@
 //! Accreditation Organisations, which accredit Trusted Issuers. Each tier
 //! is scoped to the credential types it lists, and a child can never be
 //! scoped wider than the party that accredited it.
+//!
+//! A party is named the way its credentials name their issuer: by a DID for
+//! DCP (and any issuer that signs with a DID), or by its Credential Issuer
+//! Identifier, an https URL, for OID4VCI. Both kinds share one chain, so a
+//! DID-named TAO can accredit a URL-named issuer and the other way round.
 
 use serde::{Deserialize, Serialize};
 

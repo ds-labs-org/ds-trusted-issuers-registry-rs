@@ -107,7 +107,7 @@ impl Registry {
 
     /// Inserts or replaces a record after validating it against the
     /// registry's current contents. `now` becomes its `updated_at`. The
-    /// record's `id` and `accredited_by` are stored in [`canonical_did`]
+    /// record's `id` and `accredited_by` are stored in [`canonical_id`]
     /// form, so a rewrite in another spelling replaces instead of
     /// duplicating.
     pub fn upsert(&mut self, mut record: IssuerRecord, now: u64) -> Result<(), RegistryError> {
@@ -168,7 +168,7 @@ impl Registry {
     /// [`Registry::upsert`] (a data file loaded from disk, a snapshot),
     /// inserting accreditors before the records they accredit. Keeps
     /// `version` and each record's `updated_at`. Records are brought to
-    /// [`canonical_did`] form first, and two that collapse to the same DID
+    /// [`canonical_id`] form first, and two that collapse to the same id
     /// are refused as [`RegistryError::Duplicate`] rather than one silently
     /// shadowing the other.
     pub fn revalidated(self) -> Result<Registry, RegistryError> {
@@ -522,9 +522,9 @@ fn is_issuer_id(s: &str) -> bool {
 /// (lowercase scheme and host). The host follows the did:web rules
 /// ([`is_dns_name`]): no IP address, no trailing dot and no userinfo, so the
 /// party is always named by a DNS name. The port is an [`is_port`] that is
-/// not 443, which https already implies. The path is empty or `/` and
-/// non-empty segments ([`is_url_path_segment`]), so it never ends in `/`:
-/// OID4VCI strips a trailing `/` before building the metadata URL
+/// not 443, which https already implies. The path is empty or made of
+/// `/`-led non-empty segments (`is_url_path_segment`), so it never ends in
+/// `/`: OID4VCI strips a trailing `/` before building the metadata URL
 /// (`/.well-known/openid-credential-issuer` + path), and URL parsers add one
 /// to a bare origin, so `https://issuer.example/` and
 /// `https://issuer.example` fetch the same metadata.

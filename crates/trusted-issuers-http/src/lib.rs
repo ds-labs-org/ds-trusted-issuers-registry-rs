@@ -5,8 +5,9 @@
 //! - `GET /health`
 //! - `GET /.well-known/did.json` - the registry's own `did:web` document,
 //!   holding the key that signs snapshots
-//! - `GET /v1/issuers[?credentialType=T&role=R&status=S]` - every record,
-//!   optionally only those scoped for `T`, in role `R`, with status `S` (a listing, not an allow-list: suspended or
+//! - `GET /v1/issuers[?credentialType=T&role=R&status=S&idKind=K]` - every record,
+//!   optionally only those scoped for `T`, in role `R`, with status `S`, named
+//!   by a DID or a URL (`idKind=did|url`) (a listing, not an allow-list: suspended or
 //!   expired records are included - use the trust check for decisions)
 //! - `GET /v1/issuers/{id}` - one record
 //! - `GET /v1/issuers/{id}/types/{type}` - the accreditation-chain trust
@@ -25,8 +26,10 @@
 //! - `PATCH /v1/issuers/{id}/status` - `{"status": "suspended"}` etc.
 //! - `DELETE /v1/issuers/{id}`
 //!
-//! DIDs go in the path percent-encoded as one segment, so a `did:web` with a
-//! port (`did:web:host%3A8080`) is sent as `did:web:host%253A8080`.
+//! `{id}` is a DID (DCP issuers) or an OID4VCI credential issuer URL, sent
+//! percent-encoded as one segment: a `did:web` with a port
+//! (`did:web:host%3A8080`) is sent as `did:web:host%253A8080`, and
+//! `https://issuer.example/tenant` as `https:%2F%2Fissuer.example%2Ftenant`.
 
 use std::io::Write;
 use std::path::{Path as FsPath, PathBuf};
@@ -352,7 +355,7 @@ async fn put_issuer(
     body: Result<Json<PutBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     // Compare and store the canonical form, so the path and body may spell
-    // the same DID differently.
+    // the same id differently.
     let id = canonical_id(&id);
     let body = match body {
         Ok(Json(b)) => b,
