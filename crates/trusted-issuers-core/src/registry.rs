@@ -451,12 +451,21 @@ fn uppercase_escapes(s: &str) -> String {
 /// `did:web` is stricter: its first segment is a DNS host, optionally
 /// followed by `%3A` and a port (see [`is_did_web_host`]), and the others
 /// are path segments with one spelling each (see
-/// [`is_did_web_path_segment`]).
+/// [`is_did_web_path_segment`]). The path as a whole may not be the sole
+/// segment `.well-known`: the resolver turns a DID without a path into
+/// `https://<host>/.well-known/did.json`, and that path into the same URL, so
+/// `did:web:host` and `did:web:host:.well-known` would be two spellings of
+/// one party. Anywhere else in a path `.well-known` is an ordinary directory
+/// name.
 fn is_did(s: &str) -> bool {
     is_did_core(s)
         && s.strip_prefix("did:web:").is_none_or(|rest| {
             let mut segments = rest.split(':');
-            segments.next().is_some_and(is_did_web_host) && segments.all(is_did_web_path_segment)
+            let host = segments.next();
+            let path: Vec<&str> = segments.collect();
+            host.is_some_and(is_did_web_host)
+                && path != [".well-known"]
+                && path.iter().all(|segment| is_did_web_path_segment(segment))
         })
 }
 
