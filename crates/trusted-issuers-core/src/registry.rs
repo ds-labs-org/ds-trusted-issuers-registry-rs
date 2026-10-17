@@ -223,6 +223,7 @@ impl Registry {
         {
             return Err(RegistryError::NoCredentialTypes);
         }
+        crate::x509::check_anchors(self, record)?;
         if record.role != Role::RootTao
             && record
                 .credential_types

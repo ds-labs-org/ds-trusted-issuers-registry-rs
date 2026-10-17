@@ -122,12 +122,17 @@ impl TrustList {
         now: u64,
         eku: Option<&str>,
     ) -> TrustDecision {
-        let _ = (x5c, credential_type, now, eku);
-        TrustDecision {
-            trusted: false,
-            chain: vec![],
-            reason: Some("not implemented".into()),
+        if now >= self.exp {
+            return TrustDecision {
+                trusted: false,
+                chain: vec![],
+                reason: Some(format!(
+                    "the trust list expired at {}; fetch a new snapshot",
+                    self.exp
+                )),
+            };
         }
+        self.registry.check_x5c(x5c, credential_type, now, eku)
     }
 
     pub fn registry(&self) -> &Registry {

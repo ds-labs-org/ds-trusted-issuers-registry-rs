@@ -12,7 +12,18 @@
 //! must pass: a valid chain to the anchor of a suspended party, or of one
 //! not scoped for the credential type, is not trusted.
 
-use crate::registry::{Registry, TrustDecision};
+use std::time::Duration;
+
+use base64::Engine;
+use rustls_pki_types::{CertificateDer, TrustAnchor, UnixTime};
+use webpki::{EndEntityCert, ExtendedKeyUsageValidator, KeyPurposeId, KeyPurposeIdIter};
+use x509_cert::Certificate;
+use x509_cert::der::Decode;
+use x509_cert::der::oid::{AssociatedOid, ObjectIdentifier};
+use x509_cert::ext::pkix::ExtendedKeyUsage;
+
+use crate::model::IssuerRecord;
+use crate::registry::{Registry, RegistryError, TrustDecision};
 
 /// Most anchors one record may list.
 pub const MAX_ANCHORS_PER_RECORD: usize = 10;
@@ -23,8 +34,127 @@ pub const MAX_ANCHOR_BYTES: usize = 16 * 1024;
 /// The DER encoding of a dotted OID such as `1.0.18013.5.1.2` (the mDL
 /// document signer extended key usage), or `None` when it isn't one.
 pub fn oid_der(dotted: &str) -> Option<Vec<u8>> {
-    let _ = dotted;
-    None
+    parse_oid(dotted).map(|oid| oid.as_bytes().to_vec())
+}
+
+/// A dotted OID written one way only: arcs of ASCII digits, none empty and
+/// none with a leading zero. `const-oid` alone reads `1..2` as `1.2`.
+fn parse_oid(dotted: &str) -> Option<ObjectIdentifier> {
+    let well_formed = dotted.split('.').all(|arc| {
+        !arc.is_empty()
+            && arc.bytes().all(|c| c.is_ascii_digit())
+            && (arc == "0" || !arc.starts_with('0'))
+    });
+    well_formed
+        .then(|| ObjectIdentifier::new(dotted).ok())
+        .flatten()
+}
+
+/// Standard, padded base64 as in a JOSE `x5c`.
+fn decode(b64: &str) -> Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("not base64: {e}"))
+}
+
+/// Checks a record's `x509Certificates` on write: each decodes, is at most
+/// [`MAX_ANCHOR_BYTES`], parses as a trust anchor and is listed once, at
+/// most [`MAX_ANCHORS_PER_RECORD`] of them, and none is listed under
+/// another record (one anchor, one party, so a chain never proves two
+/// issuers).
+pub(crate) fn check_anchors(
+    registry: &Registry,
+    record: &IssuerRecord,
+) -> Result<(), RegistryError> {
+    let invalid = |index, reason: String| RegistryError::InvalidCertificate { index, reason };
+    if record.x509_certificates.len() > MAX_ANCHORS_PER_RECORD {
+        return Err(invalid(
+            MAX_ANCHORS_PER_RECORD,
+            format!("at most {MAX_ANCHORS_PER_RECORD} anchors per record"),
+        ));
+    }
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    for (index, b64) in record.x509_certificates.iter().enumerate() {
+        let der = decode(b64).map_err(|e| invalid(index, e))?;
+        if der.len() > MAX_ANCHOR_BYTES {
+            return Err(invalid(
+                index,
+                format!("larger than {MAX_ANCHOR_BYTES} bytes"),
+            ));
+        }
+        let cert = CertificateDer::from(der.as_slice());
+        webpki::anchor_from_trusted_cert(&cert)
+            .map_err(|e| invalid(index, format!("not an X.509 certificate: {e}")))?;
+        if seen.contains(&der) {
+            return Err(invalid(index, "listed twice".into()));
+        }
+        seen.push(der);
+    }
+    for other in registry.list().filter(|o| o.id != record.id) {
+        let shared = other
+            .x509_certificates
+            .iter()
+            .filter_map(|b64| decode(b64).ok())
+            .any(|der| seen.contains(&der));
+        if shared {
+            return Err(RegistryError::DuplicateAnchor {
+                other: other.id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The EKU rule applied to every certificate of a path: one with no EKU
+/// extension passes, one with EKUs must list `required` (when given). The
+/// leaf must additionally carry it, which [`leaf_has_eku`] checks; webpki
+/// runs this validator on intermediates too, and CAs commonly have no EKU.
+struct EkuPolicy<'a> {
+    required: Option<&'a [u8]>,
+}
+
+impl ExtendedKeyUsageValidator for EkuPolicy<'_> {
+    fn validate(&self, iter: KeyPurposeIdIter<'_, '_>) -> Result<(), webpki::Error> {
+        let Some(required) = self.required else {
+            return Ok(());
+        };
+        let wanted = KeyPurposeId::new(required);
+        let mut empty = true;
+        for id in iter {
+            empty = false;
+            if id? == wanted {
+                return Ok(());
+            }
+        }
+        if empty {
+            Ok(())
+        } else {
+            #[allow(deprecated)]
+            Err(webpki::Error::RequiredEkuNotFound)
+        }
+    }
+}
+
+/// Whether the leaf certificate lists `oid` among its extended key usages.
+fn leaf_has_eku(leaf: &[u8], oid: &ObjectIdentifier) -> bool {
+    let Ok(cert) = Certificate::from_der(leaf) else {
+        return false;
+    };
+    cert.tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .filter(|ext| ext.extn_id == ExtendedKeyUsage::OID)
+        .filter_map(|ext| ExtendedKeyUsage::from_der(ext.extn_value.as_bytes()).ok())
+        .any(|eku| eku.0.contains(oid))
+}
+
+fn untrusted(reason: impl Into<String>) -> TrustDecision {
+    TrustDecision {
+        trusted: false,
+        chain: Vec::new(),
+        reason: Some(reason.into()),
+    }
 }
 
 impl Registry {
@@ -43,12 +173,75 @@ impl Registry {
         now: u64,
         eku: Option<&str>,
     ) -> TrustDecision {
-        let _ = (x5c, credential_type, now, eku);
-        TrustDecision {
-            trusted: false,
-            chain: Vec::new(),
-            reason: Some("not implemented".into()),
+        let Some((leaf_b64, rest)) = x5c.split_first() else {
+            return untrusted("the certificate chain is empty");
+        };
+        let eku_oid = match eku {
+            None => None,
+            Some(dotted) => match parse_oid(dotted) {
+                Some(oid) => Some(oid),
+                None => return untrusted(format!("'{dotted}' is not an OID")),
+            },
+        };
+        let decoded: Result<Vec<Vec<u8>>, String> = std::iter::once(leaf_b64)
+            .chain(rest)
+            .map(|b| decode(b))
+            .collect();
+        let decoded = match decoded {
+            Ok(d) => d,
+            Err(e) => return untrusted(format!("the certificate chain is malformed: {e}")),
+        };
+        let leaf_der = CertificateDer::from(decoded[0].as_slice());
+        let leaf = match EndEntityCert::try_from(&leaf_der) {
+            Ok(leaf) => leaf,
+            Err(e) => return untrusted(format!("the leaf is not an X.509 certificate: {e}")),
+        };
+        if let Some(oid) = &eku_oid
+            && !leaf_has_eku(&decoded[0], oid)
+        {
+            return untrusted(format!(
+                "the leaf certificate lacks extended key usage {oid}"
+            ));
         }
+        let intermediates: Vec<CertificateDer<'_>> = decoded[1..]
+            .iter()
+            .map(|der| CertificateDer::from(der.as_slice()))
+            .collect();
+        let policy = EkuPolicy {
+            required: eku_oid.as_ref().map(|oid| oid.as_bytes()),
+        };
+        let time = UnixTime::since_unix_epoch(Duration::from_secs(now));
+        let mut last_error = None;
+        for record in self.list().filter(|r| !r.x509_certificates.is_empty()) {
+            let ders: Vec<CertificateDer<'static>> = record
+                .x509_certificates
+                .iter()
+                .filter_map(|b64| decode(b64).ok())
+                .map(CertificateDer::from)
+                .collect();
+            let anchors: Vec<TrustAnchor<'_>> = ders
+                .iter()
+                .filter_map(|der| webpki::anchor_from_trusted_cert(der).ok())
+                .collect();
+            match leaf.verify_for_usage(
+                webpki::ALL_VERIFICATION_ALGS,
+                &anchors,
+                &intermediates,
+                time,
+                &policy,
+                None,
+                None,
+            ) {
+                Ok(_) => return self.check(&record.id, credential_type, now),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        untrusted(match last_error {
+            None => "no record lists an X.509 trust anchor".to_string(),
+            Some(e) => format!(
+                "the certificate chain does not validate against a listed trust anchor: {e}"
+            ),
+        })
     }
 }
 
@@ -169,7 +362,9 @@ pub(crate) mod tests {
             oid_der("1.3.6.1.5.5.7.3.1"),
             Some(vec![0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01])
         );
-        for bad in ["", "1", "3.1", "1.40", "1.2.x", "1..2", "1.2."] {
+        for bad in [
+            "", "1", "3.1", "1.40", "1.2.x", "1..2", "1.2.", "1.02", ".1.2",
+        ] {
             assert_eq!(oid_der(bad), None, "{bad}");
         }
     }
@@ -178,9 +373,12 @@ pub(crate) mod tests {
     fn a_chain_to_a_listed_anchor_of_a_trusted_party_is_trusted() {
         let p = pki();
         let ds = leaf(&p.iaca, Some(MDL_DS), (2030, 1, 1));
-        let d = p
-            .registry
-            .check_x5c(&[ds.clone()], "org.iso.18013.5.1.mDL", NOW, None);
+        let d = p.registry.check_x5c(
+            std::slice::from_ref(&ds),
+            "org.iso.18013.5.1.mDL",
+            NOW,
+            None,
+        );
         assert!(d.trusted, "{d:?}");
         assert_eq!(d.chain, vec![MDL_ISSUER, ROOT]);
         // With the mDL document signer EKU required.
@@ -240,7 +438,7 @@ pub(crate) mod tests {
         // Out of scope.
         let d = p
             .registry
-            .check_x5c(&[ds.clone()], "MembershipCredential", NOW, None);
+            .check_x5c(std::slice::from_ref(&ds), "MembershipCredential", NOW, None);
         assert!(!d.trusted);
         assert_eq!(d.chain, vec![MDL_ISSUER]);
         // Suspended accreditor.
@@ -305,7 +503,7 @@ pub(crate) mod tests {
         let ds = leaf(&p.iaca, Some(MDL_DS), (2030, 1, 1));
         assert!(
             list.check_x5c(
-                &[ds.clone()],
+                std::slice::from_ref(&ds),
                 "org.iso.18013.5.1.mDL",
                 NOW,
                 Some(MDL_DS_EKU)
