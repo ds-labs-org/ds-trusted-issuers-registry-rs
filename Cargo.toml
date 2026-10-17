@@ -3,7 +3,15 @@ resolver = "2"
 members = [
     "crates/trusted-issuers-core",
     "crates/trusted-issuers-http",
+    "crates/trusted-issuers-graph",
+    "crates/trusted-issuers-contreforts",
+    "vendor/contreforts-core",
 ]
+
+# vendor/contreforts-core's own Cargo.toml inherits `version`/`edition` via
+# `.workspace = true`: it is designed to be vendored as a workspace member of
+# a consuming project, exactly as ds-identity-hub-rs and ds-sql-dps-rs do
+# with the same submodule at the same commit.
 
 [workspace.package]
 version = "0.1.0"
@@ -28,3 +36,16 @@ p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 clap = { version = "4", features = ["derive", "env"] }
 # SHA-256 for the audit log's hash chain; the same 0.10 line p256 uses.
 sha2 = "0.10"
+
+# Contreforts-backed storage (crates/trusted-issuers-graph,
+# crates/trusted-issuers-contreforts), on the same Oxigraph line as
+# ds-identity-hub-rs. Unlike the hub's in-memory graph, the registry's store
+# of record must survive restarts, so the `rocksdb` feature (on-disk store,
+# a C++ build of RocksDB) is enabled.
+oxigraph = { version = "0.5", default-features = false, features = ["rocksdb"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+# Required only because vendor/contreforts-core inherits these via
+# `.workspace = true`; not used directly by this project's own crates.
+dirs = "5"
+urlencoding = "2"

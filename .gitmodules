@@ -1,0 +1,3 @@
+[submodule "vendor/contreforts-core"]
+	path = vendor/contreforts-core
+	url = https://github.com/contreforts-ai/contreforts-core.git
