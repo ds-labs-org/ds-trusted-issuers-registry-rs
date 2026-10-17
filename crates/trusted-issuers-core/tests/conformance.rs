@@ -9,12 +9,15 @@
 //!
 //! - ETSI TS 119 602: `build_lote`'s output against the standard's JSON
 //!   schema (`1960201_json_schema.json`).
+//! - EBSI: every link `issue_accreditations` signs against the official
+//!   Verifiable Accreditation schema (`@cef-ebsi/vcdm1.1-accreditation-schema`).
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 use trusted_issuers_core::{
     IssuerRecord, LoteOptions, PostalAddress, Registry, Role, Status, build_lote,
+    issue_accreditations,
 };
 
 const NOW: u64 = 1_792_000_000;
@@ -182,4 +185,32 @@ fn the_lote_conforms_to_the_etsi_ts_119_602_json_schema() {
     );
     let errors = violations(&schema, &lote);
     assert!(errors.is_empty(), "{errors:#?}\n{lote:#}");
+}
+
+#[test]
+#[ignore = "needs conformance/fetch.sh"]
+fn accreditations_conform_to_the_ebsi_verifiable_accreditation_schema() {
+    let schema = json("ebsi/accreditation.json");
+    // EBSI's own examples pass, so a failure below is ours, not the setup's.
+    for example in ["accredited-to-accredit", "accredited-to-attest"] {
+        let errors = violations(&schema, &json(&format!("ebsi/examples/{example}.json")));
+        assert!(errors.is_empty(), "{example}: {errors:#?}");
+    }
+    let registry = registry();
+    let key = dcp_core::DcpKeyPair::generate("did:web:registry.example".into());
+    let mut links = std::collections::BTreeMap::new();
+    for issuer in [
+        "did:web:issuer.example",
+        "https://issuer.example/tenants/acme",
+    ] {
+        for token in issue_accreditations(&registry, issuer, &key, NOW, 3600).unwrap() {
+            let (_, _, payload) = dcp_core::decode_jws_unverified(&token).unwrap();
+            links.insert(payload["sub"].as_str().unwrap().to_string(), payload);
+        }
+    }
+    assert_eq!(links.len(), 4, "the root, the TAO and both issuers");
+    for (id, payload) in links {
+        let errors = violations(&schema, &payload["vc"]);
+        assert!(errors.is_empty(), "{id}: {errors:#?}\n{:#}", payload["vc"]);
+    }
 }

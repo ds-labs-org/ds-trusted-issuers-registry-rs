@@ -11,6 +11,7 @@
 #   ebsi/accreditation.json        EBSI Verifiable Accreditation schema
 #   ebsi/attestation.json          EBSI Verifiable Attestation (its base)
 #                                  (npm @cef-ebsi/vcdm1.1-*-schema 2.0.0)
+#   ebsi/examples/*.json           EBSI's own accreditation examples
 #   limbo/limbo.json               C2SP x509-limbo X.509 path validation vectors
 #
 # Usage: conformance/fetch.sh && cargo test -p trusted-issuers-core --test conformance -- --ignored
@@ -20,7 +21,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${CONFORMANCE_DIR:-$ROOT/target/conformance}"
 # Downloads are kept (and re-verified) in $DL, so a rerun fetches nothing.
 DL="$OUT/downloads"
-mkdir -p "$OUT/etsi" "$OUT/ebsi" "$OUT/limbo" "$DL"
+mkdir -p "$OUT/etsi" "$OUT/ebsi/examples" "$OUT/limbo" "$DL"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -56,6 +57,8 @@ for name in accreditation attestation; do
   tar -xzf "$DL/$name.tgz" -C "$TMP" package/schema.json
   mv "$TMP/package/schema.json" "$OUT/ebsi/$name.json"
 done
+tar -xzf "$DL/accreditation.tgz" -C "$TMP" package/examples
+mv "$TMP"/package/examples/*.json "$OUT/ebsi/examples/"
 
 fetch "https://raw.githubusercontent.com/C2SP/x509-limbo/$LIMBO_COMMIT/limbo.json" "$LIMBO_SHA256" "$OUT/limbo/limbo.json"
 
