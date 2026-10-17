@@ -72,13 +72,37 @@ impl AuditEntry {
     /// The entry that follows `prev` (or starts the chain), with `seq`,
     /// `prev_hash` and `hash` filled in.
     pub fn next(prev: Option<&AuditEntry>, record: AuditRecord) -> AuditEntry {
-        let _ = (prev, record);
-        todo!()
+        let mut entry = AuditEntry {
+            seq: prev.map_or(1, |p| p.seq + 1),
+            at: record.at,
+            actor: record.actor,
+            action: record.action,
+            id: record.id,
+            before: record.before,
+            after: record.after,
+            version: record.version,
+            prev_hash: prev.map_or_else(|| GENESIS_HASH.to_string(), |p| p.hash.clone()),
+            hash: String::new(),
+        };
+        entry.hash = entry.expected_hash();
+        entry
     }
 
-    /// What [`AuditEntry::hash`] should be for this entry's content.
+    /// What [`AuditEntry::hash`] should be for this entry's content: the hex
+    /// SHA-256 of its JSON serialization with `hash` empty. Field order is
+    /// the struct's and records serialize the same way after a round trip,
+    /// so the hash can be recomputed from a stored copy.
     pub fn expected_hash(&self) -> String {
-        String::new()
+        use sha2::{Digest, Sha256};
+        let unhashed = AuditEntry {
+            hash: String::new(),
+            ..self.clone()
+        };
+        let bytes = serde_json::to_vec(&unhashed).expect("an audit entry always serializes");
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
@@ -98,7 +122,25 @@ pub enum AuditError {
 /// [`GENESIS_HASH`]. A page that starts later is checked from its first
 /// entry on.
 pub fn verify_audit_chain(entries: &[AuditEntry]) -> Result<(), AuditError> {
-    let _ = entries;
+    let mut prev: Option<&AuditEntry> = None;
+    for entry in entries {
+        if entry.hash != entry.expected_hash() {
+            return Err(AuditError::BadHash { seq: entry.seq });
+        }
+        match prev {
+            Some(p) if entry.seq != p.seq + 1 || entry.prev_hash != p.hash => {
+                return Err(AuditError::BrokenLink {
+                    seq: entry.seq,
+                    prev: p.seq,
+                });
+            }
+            None if entry.seq == 1 && entry.prev_hash != GENESIS_HASH => {
+                return Err(AuditError::BadGenesis);
+            }
+            _ => {}
+        }
+        prev = Some(entry);
+    }
     Ok(())
 }
 
