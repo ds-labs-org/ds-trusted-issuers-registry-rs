@@ -56,6 +56,7 @@ struct Terms {
     role: NamedNode,
     label: NamedNode,
     credential_type: NamedNode,
+    x509_certificate: NamedNode,
     value: NamedNode,
     order: NamedNode,
     accredited_by: NamedNode,
@@ -93,6 +94,7 @@ impl Terms {
             role: n(tir("role")),
             label: n(rdfs("label")),
             credential_type: n(tir("credentialType")),
+            x509_certificate: n(tir("x509Certificate")),
             value: n(tir("value")),
             order: n(tir("order")),
             accredited_by: n(tir("accreditedBy")),
@@ -250,6 +252,7 @@ impl RegistryGraph {
         };
         let (mut role, mut status) = (None, None);
         let mut types: Vec<(u64, String)> = Vec::new();
+        let mut anchors: Vec<(u64, String)> = Vec::new();
         for quad in
             self.store
                 .quads_for_pattern(Some(node.as_ref().into()), None, None, Some(records))
@@ -284,12 +287,19 @@ impl RegistryGraph {
                     return Err(malformed("issuer record", "credentialType is not a node"));
                 };
                 types.push(self.ordered_value(t, item, records)?);
+            } else if *p == t.x509_certificate {
+                let Term::BlankNode(item) = o else {
+                    return Err(malformed("issuer record", "x509Certificate is not a node"));
+                };
+                anchors.push(self.ordered_value(t, item, records)?);
             }
         }
         record.role = role.ok_or_else(|| malformed("issuer record", "no role"))?;
         record.status = status.ok_or_else(|| malformed("issuer record", "no status"))?;
         types.sort();
         record.credential_types = types.into_iter().map(|(_, v)| v).collect();
+        anchors.sort();
+        record.x509_certificates = anchors.into_iter().map(|(_, v)| v).collect();
         Ok(record)
     }
 
@@ -530,15 +540,20 @@ fn record_quads(t: &Terms, record: &IssuerRecord) -> Result<Vec<Quad>, GraphErro
     if let Some(until) = record.valid_until {
         add(subject(), &t.valid_until, t.int(until).into());
     }
-    for (i, credential_type) in record.credential_types.iter().enumerate() {
-        let item = BlankNode::default();
-        add(subject(), &t.credential_type, item.clone().into());
-        add(item.clone().into(), &t.order, t.int(i as u64).into());
-        add(
-            item.into(),
-            &t.value,
-            Literal::new_simple_literal(credential_type).into(),
-        );
+    for (predicate, values) in [
+        (&t.credential_type, &record.credential_types),
+        (&t.x509_certificate, &record.x509_certificates),
+    ] {
+        for (i, value) in values.iter().enumerate() {
+            let item = BlankNode::default();
+            add(subject(), predicate, item.clone().into());
+            add(item.clone().into(), &t.order, t.int(i as u64).into());
+            add(
+                item.into(),
+                &t.value,
+                Literal::new_simple_literal(value).into(),
+            );
+        }
     }
     Ok(quads)
 }

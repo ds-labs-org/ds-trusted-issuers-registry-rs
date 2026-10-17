@@ -12,6 +12,9 @@
 //! - `GET /v1/issuers/{id}` - one record
 //! - `GET /v1/issuers/{id}/types/{type}` - the accreditation-chain trust
 //!   decision for `id` issuing `type`, right now
+//! - `POST /v1/x509/check` - `{x5c, credentialType, eku?}`: whether a
+//!   certificate chain proves an issuer trusted for that type, via a listed
+//!   X.509 trust anchor and that party's accreditation chain
 //! - `GET /v1/snapshot` - the whole registry as a signed compact JWS
 //!   (`application/trust-list+jwt`)
 //!
@@ -39,7 +42,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use dcp_core::{DcpKeyPair, now_secs};
 use serde::Deserialize;
@@ -124,6 +127,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/issuers/{id}", get(get_issuer))
         .route("/v1/issuers/{id}/types/{credential_type}", get(check_trust))
         .route("/v1/snapshot", get(snapshot))
+        .route("/v1/x509/check", post(check_x5c))
         .merge(admin)
         .with_state(state)
 }
@@ -367,6 +371,47 @@ async fn check_trust(
     Json(decision).into_response()
 }
 
+/// The `POST /v1/x509/check` body.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct X5cCheck {
+    /// Base64 DER certificates, leaf first, as in a JOSE `x5c`.
+    x5c: Vec<String>,
+    credential_type: String,
+    /// Dotted OID the leaf must carry as an extended key usage.
+    eku: Option<String>,
+}
+
+/// Most certificates `POST /v1/x509/check` takes in one chain.
+const MAX_X5C_LEN: usize = 10;
+
+/// `POST /v1/x509/check`: whether a certificate chain proves an issuer
+/// trusted for a credential type now (see `Registry::check_x5c`). A POST
+/// because a chain is too large for a path; it changes nothing.
+async fn check_x5c(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<X5cCheck>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    if body.x5c.len() > MAX_X5C_LEN {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("x5c may hold at most {MAX_X5C_LEN} certificates"),
+        )
+        .into_response();
+    }
+    let decision = state.registry.read().await.check_x5c(
+        &body.x5c,
+        &body.credential_type,
+        now_secs(),
+        body.eku.as_deref(),
+    );
+    Json(decision).into_response()
+}
+
 async fn snapshot(State(state): State<Arc<AppState>>) -> Response {
     let token = sign_snapshot(
         &*state.registry.read().await,
@@ -407,6 +452,8 @@ struct PutBody {
     valid_from: Option<u64>,
     valid_until: Option<u64>,
     status: Status,
+    #[serde(default)]
+    x509_certificates: Vec<String>,
     /// Accepted so a GET response can be PUT back; always overwritten.
     #[serde(rename = "updatedAt")]
     _updated_at: Option<u64>,
@@ -437,7 +484,7 @@ async fn put_issuer(
         valid_from: body.valid_from,
         valid_until: body.valid_until,
         status: body.status,
-        x509_certificates: Vec::new(),
+        x509_certificates: body.x509_certificates,
         updated_at: 0,
     };
     let mut created = false;
