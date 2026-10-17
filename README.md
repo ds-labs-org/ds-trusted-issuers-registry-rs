@@ -49,6 +49,10 @@ accredited.
 the child's types, and not close a cycle or make a chain longer than 8
 links. A record that still accredits
 others can't be removed or demoted to `ti`. Failed writes change nothing.
+Narrowing an accreditor's types is accepted even when existing dependents
+fall outside the new scope; the trust check denies those dependents for
+the types they lost, and rewriting one of them is refused until its types
+fit again.
 
 **DID canonicalization.** `did:web` DIDs are stored and looked up in one
 canonical form: the DNS host is lowercased and the hex digits of
@@ -153,7 +157,8 @@ A verifier fetches it once, verifies it against the key in the registry's
 DID document, and answers trust checks locally until `exp`, with no call to
 the registry per credential. `version` increases on every write, so a
 verifier can tell whether its copy is stale. `verify_snapshot` also
-re-applies the write rules to the contents, refuses an expired snapshot, one
+re-applies the write rules to the contents (all but the accreditor-scope
+rule, which the trust check enforces), refuses an expired snapshot, one
 whose `iat` is not before `exp`, and one whose `iat` is more than
 `SNAPSHOT_CLOCK_SKEW_SECS` (60) in the future. Responses carry
 `Cache-Control: max-age` of a quarter of the TTL, so shared caches never
@@ -205,7 +210,7 @@ cargo run -p trusted-issuers-http --bin trusted-issuers-registry -- \
 | `--bind` | `0.0.0.0:8090` | listen address |
 | `--did-host` | required | host the registry's `did:web` resolves to |
 | `--signing-key-file` | ephemeral key | PKCS#8 PEM P-256 key that signs snapshots |
-| `--data-file` | in memory | JSON file loaded at start (and re-checked against the write rules) and rewritten atomically and durably after each write |
+| `--data-file` | in memory | JSON file loaded at start (and re-checked against the write rules, as `verify_snapshot` does) and rewritten atomically and durably after each write |
 | `--create-data-file` | off | start empty when `--data-file` doesn't exist yet; otherwise a missing file is a startup error |
 | `--admin-token` / `TRUSTED_ISSUERS_ADMIN_TOKEN` | disabled | bearer token for the admin API |
 | `--snapshot-ttl-secs` | `3600` | snapshot lifetime, at least 1 |

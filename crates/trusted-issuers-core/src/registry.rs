@@ -79,6 +79,15 @@ impl TrustDecision {
     }
 }
 
+/// Whether [`Registry::validate`] holds a record to its accreditor's scope:
+/// on writes, but not when revalidating stored state (see
+/// [`Registry::revalidated`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Checked,
+    Unchecked,
+}
+
 /// The registry contents. `version` increases by one on every successful
 /// write, so a verifier holding a snapshot can tell whether it is stale.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +124,7 @@ impl Registry {
     /// duplicating.
     pub fn upsert(&mut self, mut record: IssuerRecord, now: u64) -> Result<(), RegistryError> {
         canonicalize(&mut record);
-        self.validate(&record)?;
+        self.validate(&record, Scope::Checked)?;
         record.updated_at = now;
         self.issuers.insert(record.did.clone(), record);
         self.version += 1;
@@ -167,9 +176,14 @@ impl Registry {
             .unwrap_or(0)
     }
 
-    /// Re-applies every write rule to a registry that did not come through
+    /// Re-applies the write rules to a registry that did not come through
     /// [`Registry::upsert`] (a data file loaded from disk, a snapshot),
-    /// inserting accreditors before the records they accredit. Keeps
+    /// inserting accreditors before the records they accredit. The one rule
+    /// left out is the accreditor's scope: narrowing an accreditor is an
+    /// accepted write that leaves its existing dependents out of scope, and
+    /// [`Registry::check`] denies those at read time. Refusing that state
+    /// here would refuse the registry's own data file and every snapshot it
+    /// signs, distrusting every issuer instead of the out-of-scope ones. Keeps
     /// `version` and each record's `updated_at`. Records are brought to
     /// [`canonical_did`] form first, and two that collapse to the same DID
     /// are refused as [`RegistryError::Duplicate`] rather than one silently
@@ -198,14 +212,17 @@ impl Registry {
                 // Whatever is left points at a missing accreditor or forms
                 // a cycle; `validate` names the first problem.
                 let first = &rest[0];
-                return Err(out.validate(first).err().unwrap_or_else(|| {
-                    RegistryError::UnknownAccreditor(
-                        first.accredited_by.clone().unwrap_or_default(),
-                    )
-                }));
+                return Err(out
+                    .validate(first, Scope::Unchecked)
+                    .err()
+                    .unwrap_or_else(|| {
+                        RegistryError::UnknownAccreditor(
+                            first.accredited_by.clone().unwrap_or_default(),
+                        )
+                    }));
             }
             for record in ready {
-                out.validate(&record)?;
+                out.validate(&record, Scope::Unchecked)?;
                 out.issuers.insert(record.did.clone(), record);
             }
             pending = rest;
@@ -213,7 +230,7 @@ impl Registry {
         Ok(out)
     }
 
-    fn validate(&self, record: &IssuerRecord) -> Result<(), RegistryError> {
+    fn validate(&self, record: &IssuerRecord, scope: Scope) -> Result<(), RegistryError> {
         if !is_did(&record.did) {
             return Err(RegistryError::InvalidDid(record.did.clone()));
         }
@@ -266,7 +283,7 @@ impl Registry {
                 if let Some(t) = record
                     .credential_types
                     .iter()
-                    .find(|t| !accreditor.covers(t))
+                    .find(|t| scope == Scope::Checked && !accreditor.covers(t))
                 {
                     return Err(RegistryError::AccreditorScope {
                         accreditor: accreditor_did.clone(),
@@ -778,6 +795,27 @@ mod tests {
         let d = r.check(TI, "MembershipCredential", 10);
         assert!(!d.trusted);
         assert_eq!(d.chain, vec![TI, TAO]);
+    }
+
+    #[test]
+    fn a_narrowed_accreditor_still_revalidates() {
+        let mut r = three_tier();
+        r.upsert(
+            record(TAO, Role::Tao, &["DataProcessorCredential"], Some(ROOT)),
+            2,
+        )
+        .unwrap();
+        let reloaded = r.clone().revalidated().expect("a state upsert produced");
+        assert_eq!(reloaded, r);
+        assert!(!reloaded.check(TI, "MembershipCredential", 10).trusted);
+        // Writing the out-of-scope dependent again is still refused.
+        assert!(matches!(
+            r.upsert(
+                record(TI, Role::Ti, &["MembershipCredential"], Some(TAO)),
+                3
+            ),
+            Err(RegistryError::AccreditorScope { .. })
+        ));
     }
 
     #[test]
