@@ -13,6 +13,12 @@ members = [
 # a consuming project, exactly as ds-identity-hub-rs and ds-sql-dps-rs do
 # with the same submodule at the same commit.
 
+# RocksDB (under oxigraph's `rocksdb` feature) is a large C++ build; with
+# debug info each build of it takes ~1.8 GB of target/. Nobody steps through
+# RocksDB, so build it without.
+[profile.dev.package.oxrocksdb-sys]
+debug = false
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
