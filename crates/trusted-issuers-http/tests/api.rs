@@ -427,7 +427,8 @@ async fn a_data_file_named_tmp_is_still_written_atomically() {
     let leftovers: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())
-        .filter(|n| n != "registry.tmp")
+        // The audit log lives next to the data file by design.
+        .filter(|n| n != "registry.tmp" && n != "registry.tmp.audit.jsonl")
         .collect();
     assert!(
         leftovers.is_empty(),

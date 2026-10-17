@@ -62,6 +62,10 @@ pub struct AppState {
     admin_token: Option<String>,
     /// Where each write is made durable, together with its audit entry.
     pub store: Arc<dyn Store>,
+    /// Request header naming the person behind an admin write, set by the
+    /// gateway after it authenticated them; `None` records every write as
+    /// `admin`.
+    audit_actor_header: Option<header::HeaderName>,
     pub snapshot_ttl_secs: u64,
 }
 
@@ -81,14 +85,23 @@ impl AppState {
             key,
             admin_token: admin_token.filter(|t| !t.trim().is_empty()),
             store,
+            audit_actor_header: None,
             snapshot_ttl_secs,
         }
     }
 
     /// Takes the audit log's actor from request header `name`, as set by
-    /// the gateway in front of the admin API.
-    pub fn with_audit_actor_header(self, name: &str) -> Self {
-        let _ = name;
+    /// the gateway in front of the admin API once it has authenticated the
+    /// person (for example `X-Forwarded-User`). Only trustworthy when
+    /// nothing but that gateway can reach the admin API: anyone else holding
+    /// the admin token could set the header too.
+    ///
+    /// # Panics
+    ///
+    /// When `name` is not a valid header name.
+    pub fn with_audit_actor_header(mut self, name: &str) -> Self {
+        self.audit_actor_header =
+            Some(header::HeaderName::try_from(name).expect("a valid header name"));
         self
     }
 
@@ -102,6 +115,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/issuers/{id}", put(put_issuer).delete(delete_issuer))
         .route("/v1/issuers/{id}/status", patch(patch_status))
         .route("/v1/admin", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/v1/admin/audit", get(audit_log))
         .route_layer(from_fn_with_state(state.clone(), require_admin));
     Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -222,9 +236,84 @@ async fn apply(
     Ok(next)
 }
 
-/// Who is making an admin write, for the audit log.
-fn actor() -> String {
-    "admin".to_string()
+/// Longest actor name kept in the audit log.
+const MAX_ACTOR_LEN: usize = 256;
+
+/// Who is making an admin write, for the audit log: the configured gateway
+/// header's value when it is present, non-empty, printable and at most
+/// [`MAX_ACTOR_LEN`] bytes, otherwise `admin` (the holder of the admin
+/// token).
+fn actor(state: &AppState, headers: &header::HeaderMap) -> String {
+    state
+        .audit_actor_header
+        .as_ref()
+        .and_then(|name| headers.get(name))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= MAX_ACTOR_LEN && !v.chars().any(char::is_control))
+        .unwrap_or("admin")
+        .to_string()
+}
+
+/// Largest page `GET /v1/admin/audit` returns.
+pub const MAX_AUDIT_PAGE: usize = 1000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditQuery {
+    #[serde(default)]
+    after: u64,
+    limit: Option<usize>,
+    id: Option<String>,
+}
+
+/// `GET /v1/admin/audit[?after=N&limit=L&id=ID]`: entries with `seq` above
+/// `N`, oldest first, at most `L` (default 100, at most
+/// [`MAX_AUDIT_PAGE`]), only those about `ID` when given; plus the head of
+/// the whole log, so a client can tell it has reached the end and pin the
+/// latest hash.
+async fn audit_log(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<AuditQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(q) => q,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
+    };
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=MAX_AUDIT_PAGE).contains(&limit) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {MAX_AUDIT_PAGE}"),
+        )
+        .into_response();
+    }
+    let id = query.id.as_deref().map(canonical_id);
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let head = store.audit_head();
+        store
+            .audit_page(query.after, limit, id.as_deref())
+            .map(|entries| (entries, head))
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|r| r);
+    match result {
+        Ok((entries, head)) => Json(json!({
+            "entries": entries,
+            "head": head.map(|h| json!({"seq": h.seq, "hash": h.hash})),
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!("failed to read the audit log: {e}");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the audit log could not be read",
+            )
+            .into_response()
+        }
+    }
 }
 
 async fn did_document(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -326,6 +415,7 @@ struct PutBody {
 async fn put_issuer(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: header::HeaderMap,
     body: Result<Json<PutBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     // Compare and store the canonical form, so the path and body may spell
@@ -350,10 +440,16 @@ async fn put_issuer(
         updated_at: 0,
     };
     let mut created = false;
-    let result = apply(&state, actor(), AuditAction::Put, &id, |registry| {
-        created = registry.get(&id).is_none();
-        registry.upsert(record, now_secs())
-    })
+    let result = apply(
+        &state,
+        actor(&state, &headers),
+        AuditAction::Put,
+        &id,
+        |registry| {
+            created = registry.get(&id).is_none();
+            registry.upsert(record, now_secs())
+        },
+    )
     .await;
     match result {
         Ok(registry) => {
@@ -377,15 +473,20 @@ struct StatusBody {
 async fn patch_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: header::HeaderMap,
     body: Result<Json<StatusBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let body = match body {
         Ok(Json(b)) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()).into_response(),
     };
-    match apply(&state, actor(), AuditAction::Status, &id, |registry| {
-        registry.set_status(&id, body.status, now_secs())
-    })
+    match apply(
+        &state,
+        actor(&state, &headers),
+        AuditAction::Status,
+        &id,
+        |registry| registry.set_status(&id, body.status, now_secs()),
+    )
     .await
     {
         Ok(registry) => Json(registry.get(&id)).into_response(),
@@ -393,10 +494,18 @@ async fn patch_status(
     }
 }
 
-async fn delete_issuer(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match apply(&state, actor(), AuditAction::Delete, &id, |registry| {
-        registry.remove(&id).map(drop)
-    })
+async fn delete_issuer(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: header::HeaderMap,
+) -> Response {
+    match apply(
+        &state,
+        actor(&state, &headers),
+        AuditAction::Delete,
+        &id,
+        |registry| registry.remove(&id).map(drop),
+    )
     .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),

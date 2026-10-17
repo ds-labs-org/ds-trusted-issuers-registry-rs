@@ -48,6 +48,13 @@ struct Cli {
     #[arg(long, env = "TRUSTED_ISSUERS_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
 
+    /// Request header the gateway sets to the authenticated person behind
+    /// an admin write (e.g. `X-Forwarded-User`), recorded as the actor in
+    /// the audit log. Without it every write is recorded as `admin`. Only
+    /// set it when nothing but the gateway can reach the admin API.
+    #[arg(long, value_parser = parse_header_name)]
+    audit_actor_header: Option<String>,
+
     /// How long a signed snapshot stays valid, in seconds.
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
     snapshot_ttl_secs: u64,
@@ -79,6 +86,12 @@ fn did_from_host(host: &str) -> Result<String, String> {
         Some(port) => format!("did:web:{name}%3A{port}"),
         None => format!("did:web:{name}"),
     })
+}
+
+fn parse_header_name(name: &str) -> Result<String, String> {
+    axum::http::HeaderName::try_from(name)
+        .map(|_| name.to_string())
+        .map_err(|_| format!("'{name}' is not a valid HTTP header name"))
 }
 
 fn key_pair(did: String, signing_key: SigningKey) -> DcpKeyPair {
@@ -138,13 +151,11 @@ async fn main() -> Result<(), String> {
         cli.bind
     );
 
-    let state = Arc::new(AppState::new(
-        registry,
-        key,
-        cli.admin_token,
-        store,
-        cli.snapshot_ttl_secs,
-    ));
+    let mut state = AppState::new(registry, key, cli.admin_token, store, cli.snapshot_ttl_secs);
+    if let Some(name) = &cli.audit_actor_header {
+        state = state.with_audit_actor_header(name);
+    }
+    let state = Arc::new(state);
     if !state.admin_enabled() {
         tracing::warn!("no (or an empty) admin token configured: the admin API is disabled");
     }
