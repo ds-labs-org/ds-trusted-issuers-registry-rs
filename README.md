@@ -76,9 +76,12 @@ segments as well: one may not be `.` or `..` or escape a letter, digit,
 `did:web:host:%61lice` all fetch the document of `did:web:host:alice`.
 A path may not be just `.well-known` either
 (`did:web:host:.well-known` fetches the document of `did:web:host`);
-`.well-known` with other segments is fine. Escapes of other characters
-(`%2F`, `%7E`, ...) stay legal. `--did-host` applies the same rules to the
-registry's own DID.
+`.well-known` with other segments is fine. A path segment may not be empty
+(`did:web:host::alice` aliases `did:web:host:alice` on servers that merge
+slashes) or contain `%2F` (a server that decodes it before removing dot
+segments serves another path's document for `did:web:host:bob%2F..%2Falice`).
+Escapes of other characters (`%3A`, `%7E`, ...) stay legal. `--did-host`
+applies the same rules to the registry's own DID.
 
 **Upgrading.** On startup, data files and snapshots are re-checked under
 this DID syntax and canonical form. A record whose DID is now invalid or
@@ -87,10 +90,11 @@ the DID; fix or remove it in the file before upgrading. Besides DID URLs
 (`#fragment`, `?query`), that covers `did:web` hosts that earlier versions
 accepted: escapes other than the port's `%3A` (`%2F`, `%40`, ...), `_`,
 empty or hyphen-edged labels, a trailing dot, IP addresses, and ports that
-are 0, above 65535, 443 or written with leading zeros, and path segments
-that are `.` or `..` or escape a letter, digit, `-`, `.` or `_`
-(`user%2Dx`), or a path that is just `.well-known`. `--did-host` likewise
-refuses an IP address, port 443 or a port with leading zeros.
+are 0, above 65535, 443 or written with leading zeros, path segments that
+are empty (`host::alice`), `.` or `..`, or contain `%2F` or an escape of a
+letter, digit, `-`, `.` or `_` (`user%2Dx`), and a path that is just
+`.well-known`. `--did-host` likewise refuses an IP address, port 443 or a
+port with leading zeros.
 
 ## API
 

@@ -450,7 +450,7 @@ fn uppercase_escapes(s: &str) -> String {
 ///
 /// `did:web` is stricter: its first segment is a DNS host, optionally
 /// followed by `%3A` and a port (see [`is_did_web_host`]), and the others
-/// are path segments with one spelling each (see
+/// are non-empty path segments with one spelling each (see
 /// [`is_did_web_path_segment`]). The path as a whole may not be the sole
 /// segment `.well-known`: the resolver turns a DID without a path into
 /// `https://<host>/.well-known/did.json`, and that path into the same URL, so
@@ -502,13 +502,22 @@ fn is_did_web_host(segment: &str) -> bool {
 /// escapes to merge them. Such a DID is refused instead of stored as a
 /// second record for the same party, or one that reads as another tenant.
 ///
-/// A segment is refused when it is `.` or `..` or holds an escape of an
-/// ALPHA, DIGIT, `-`, `.` or `_`. Escapes of reserved characters (`%2F`,
-/// `%40`, ...) and of `~` stay legal: DID Core's idchar has no `~`, so
-/// `%7E` is the only way to write it. Assumes [`is_did_core`] already
-/// accepted the escapes as well formed.
+/// A segment is refused when it is empty, `.` or `..`, or holds an escape of
+/// an ALPHA, DIGIT, `-`, `.` or `_`, or of `/` (`%2F`, either case).
+///
+/// An empty segment (`did:web:host::alice`) makes `//` in the URL, which a
+/// server that merges slashes serves as the path without it. An encoded
+/// slash lets a path hide a `/`: `bob%2F..%2Falice` is one segment to the
+/// resolver, but a server that decodes `%2F` before it removes dot segments
+/// serves the document of `alice` for it. Neither can appear in a
+/// well-formed did:web, so they are refused instead of proving what each
+/// server does.
+///
+/// Escapes of other reserved characters (`%3A`, `%40`, ...) and of `~` stay
+/// legal: DID Core's idchar has no `~`, so `%7E` is the only way to write
+/// it. Assumes [`is_did_core`] already accepted the escapes as well formed.
 fn is_did_web_path_segment(segment: &str) -> bool {
-    !matches!(segment, "." | "..")
+    !matches!(segment, "" | "." | "..")
         && !segment.as_bytes().windows(3).any(|w| {
             // A `%` and the two hex digits after it.
             w[0] == b'%'
@@ -516,7 +525,9 @@ fn is_did_web_path_segment(segment: &str) -> bool {
                     .ok()
                     .filter(|hex| hex.bytes().all(|c| c.is_ascii_hexdigit()))
                     .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-                    .is_some_and(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_'))
+                    .is_some_and(|v| {
+                        v == b'/' || v.is_ascii_alphanumeric() || matches!(v, b'-' | b'.' | b'_')
+                    })
         })
 }
 
@@ -1322,9 +1333,10 @@ mod tests {
             "did:web:host.example:bob%2f..%2falice",
             "did:web:host.example::alice",
         ] {
+            // The error names the DID in canonical form (`%2f` is `%2F`).
             assert_eq!(
                 r.upsert(by_tao(alias), 2),
-                Err(RegistryError::InvalidDid(alias.into())),
+                Err(RegistryError::InvalidDid(canonical_did(alias))),
                 "{alias}"
             );
         }
