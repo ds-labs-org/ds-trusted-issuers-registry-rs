@@ -23,9 +23,9 @@ pub use audit::{
 };
 pub use lote::{
     DEFAULT_LOTE_TYPE, LOTE_TYP, LOTE_VERSION, LoteOptions, SERVICE_TYPE_ACCREDITATION,
-    SERVICE_TYPE_ISSUANCE, build_lote, sign_lote,
+    SERVICE_TYPE_ISSUANCE, STATUS_DETERMINATION_APPROACH, build_lote, sign_lote,
 };
-pub use model::{ANY_CREDENTIAL_TYPE, IdKind, IssuerRecord, Role, Status};
+pub use model::{ANY_CREDENTIAL_TYPE, IdKind, IssuerRecord, PostalAddress, Role, Status};
 pub use registry::{
     MAX_CHAIN_DEPTH, Registry, RegistryError, TrustDecision, canonical_did, canonical_id,
     is_credential_issuer_id, is_did_web_port, is_dns_name, is_port,

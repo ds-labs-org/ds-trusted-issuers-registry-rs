@@ -7,10 +7,11 @@ use oxigraph::model::{
 use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::{Store, Transaction};
 use trusted_issuers_core::{
-    AuditAction, AuditEntry, IssuerRecord, Registry, Role, Status, verify_audit_chain,
+    AuditAction, AuditEntry, IssuerRecord, PostalAddress, Registry, Role, Status,
+    verify_audit_chain,
 };
 
-use crate::vocab::{prov, rdf, rdfs, tir, xsd};
+use crate::vocab::{prov, rdf, rdfs, schema, tir, xsd};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
@@ -57,6 +58,13 @@ struct Terms {
     label: NamedNode,
     credential_type: NamedNode,
     x509_certificate: NamedNode,
+    address: NamedNode,
+    postal_address: NamedNode,
+    street_address: NamedNode,
+    address_locality: NamedNode,
+    postal_code: NamedNode,
+    address_region: NamedNode,
+    address_country: NamedNode,
     value: NamedNode,
     order: NamedNode,
     accredited_by: NamedNode,
@@ -95,6 +103,13 @@ impl Terms {
             label: n(rdfs("label")),
             credential_type: n(tir("credentialType")),
             x509_certificate: n(tir("x509Certificate")),
+            address: n(schema("address")),
+            postal_address: n(schema("PostalAddress")),
+            street_address: n(schema("streetAddress")),
+            address_locality: n(schema("addressLocality")),
+            postal_code: n(schema("postalCode")),
+            address_region: n(schema("addressRegion")),
+            address_country: n(schema("addressCountry")),
             value: n(tir("value")),
             order: n(tir("order")),
             accredited_by: n(tir("accreditedBy")),
@@ -226,6 +241,7 @@ impl RegistryGraph {
             valid_until: None,
             status: Status::Active,
             x509_certificates: Vec::new(),
+            postal_address: None,
             updated_at: 0,
         };
         let (mut role, mut status) = (None, None);
@@ -270,6 +286,11 @@ impl RegistryGraph {
                     return Err(malformed("issuer record", "x509Certificate is not a node"));
                 };
                 anchors.push(self.ordered_value(t, item, records)?);
+            } else if *p == t.address {
+                let Term::BlankNode(item) = o else {
+                    return Err(malformed("issuer record", "address is not a node"));
+                };
+                record.postal_address = Some(self.postal_address(t, item, records)?);
             }
         }
         record.role = role.ok_or_else(|| malformed("issuer record", "no role"))?;
@@ -279,6 +300,50 @@ impl RegistryGraph {
         anchors.sort();
         record.x509_certificates = anchors.into_iter().map(|(_, v)| v).collect();
         Ok(record)
+    }
+
+    /// The `schema:PostalAddress` node `item`.
+    fn postal_address(
+        &self,
+        t: &Terms,
+        item: &BlankNode,
+        graph: GraphNameRef<'_>,
+    ) -> Result<PostalAddress, GraphError> {
+        let (mut street, mut locality, mut country) = (None, None, None);
+        let (mut postal_code, mut region) = (None, None);
+        for quad in
+            self.store
+                .quads_for_pattern(Some(item.as_ref().into()), None, None, Some(graph))
+        {
+            let quad = quad?;
+            let p = &quad.predicate;
+            let slot = if *p == t.street_address {
+                &mut street
+            } else if *p == t.address_locality {
+                &mut locality
+            } else if *p == t.address_country {
+                &mut country
+            } else if *p == t.postal_code {
+                &mut postal_code
+            } else if *p == t.address_region {
+                &mut region
+            } else {
+                continue;
+            };
+            let text = literal(&quad.object)
+                .ok_or_else(|| malformed("postal address", format!("{p} is not a literal")))?;
+            *slot = Some(text.to_string());
+        }
+        let required = |value: Option<String>, what: &str| {
+            value.ok_or_else(|| malformed("postal address", format!("no {what}")))
+        };
+        Ok(PostalAddress {
+            street_address: required(street, "streetAddress")?,
+            locality: required(locality, "addressLocality")?,
+            postal_code,
+            state_or_province: region,
+            country: required(country, "addressCountry")?,
+        })
     }
 
     /// The `(tir:order, tir:value)` of a list item node.
@@ -518,6 +583,30 @@ fn record_quads(t: &Terms, record: &IssuerRecord) -> Result<Vec<Quad>, GraphErro
     if let Some(until) = record.valid_until {
         add(subject(), &t.valid_until, t.int(until).into());
     }
+    if let Some(address) = &record.postal_address {
+        let item = BlankNode::default();
+        add(subject(), &t.address, item.clone().into());
+        add(
+            item.clone().into(),
+            &t.rdf_type,
+            t.postal_address.clone().into(),
+        );
+        for (predicate, value) in [
+            (&t.street_address, Some(&address.street_address)),
+            (&t.address_locality, Some(&address.locality)),
+            (&t.postal_code, address.postal_code.as_ref()),
+            (&t.address_region, address.state_or_province.as_ref()),
+            (&t.address_country, Some(&address.country)),
+        ] {
+            if let Some(value) = value {
+                add(
+                    item.clone().into(),
+                    predicate,
+                    Literal::new_simple_literal(value).into(),
+                );
+            }
+        }
+    }
     for (predicate, values) in [
         (&t.credential_type, &record.credential_types),
         (&t.x509_certificate, &record.x509_certificates),
@@ -598,6 +687,7 @@ mod tests {
             valid_until: None,
             status: Status::Active,
             x509_certificates: Vec::new(),
+            postal_address: None,
             updated_at: 0,
         }
     }
@@ -656,6 +746,13 @@ mod tests {
             Some(ROOT),
         );
         tao.valid_from = Some(1_700_000_000);
+        tao.postal_address = Some(PostalAddress {
+            street_address: "Rue de la Loi 200".into(),
+            locality: "Brussels".into(),
+            postal_code: Some("1049".into()),
+            state_or_province: Some("Brussels-Capital".into()),
+            country: "BE".into(),
+        });
         tao.valid_until = Some(1_900_000_000);
         let mut ti = rec(
             TI,
@@ -664,6 +761,13 @@ mod tests {
             Some(TAO),
         );
         ti.status = Status::Suspended;
+        ti.postal_address = Some(PostalAddress {
+            street_address: "1 Example Street".into(),
+            locality: "Lyon".into(),
+            postal_code: None,
+            state_or_province: None,
+            country: "FR".into(),
+        });
         ti.x509_certificates = vec![self_signed_ca("IACA A"), self_signed_ca("IACA B")];
         for record in [root, tao, ti] {
             let entry = write(&mut registry, log.last(), record);

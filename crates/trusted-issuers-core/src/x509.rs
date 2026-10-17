@@ -322,6 +322,7 @@ pub(crate) mod tests {
             valid_until: None,
             status: Status::Active,
             x509_certificates: anchors,
+            postal_address: None,
             updated_at: 0,
         }
     }

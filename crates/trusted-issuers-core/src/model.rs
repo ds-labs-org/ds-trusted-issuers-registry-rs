@@ -71,6 +71,43 @@ impl IdKind {
     }
 }
 
+/// A postal address, as the ETSI TS 119 602 LoTE carries it: street,
+/// locality and country required (the standard's XML schema requires all
+/// three, its JSON schema street and country), postal code and region
+/// optional.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostalAddress {
+    pub street_address: String,
+    pub locality: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postal_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_or_province: Option<String>,
+    /// ISO 3166-1 alpha-2 country code (`FR`, `DE`, ...).
+    pub country: String,
+}
+
+impl PostalAddress {
+    /// Why the address is unusable, if it is: an empty street or locality,
+    /// an empty optional field, or a country that is not two upper-case
+    /// letters.
+    pub fn problem(&self) -> Option<&'static str> {
+        let blank = |s: &str| s.trim().is_empty();
+        if blank(&self.street_address) || blank(&self.locality) {
+            Some("streetAddress and locality must not be empty")
+        } else if self.postal_code.as_deref().is_some_and(blank)
+            || self.state_or_province.as_deref().is_some_and(blank)
+        {
+            Some("postalCode and stateOrProvince must be omitted rather than empty")
+        } else if self.country.len() != 2 || !self.country.bytes().all(|c| c.is_ascii_uppercase()) {
+            Some("country must be an ISO 3166-1 alpha-2 code such as FR")
+        } else {
+            None
+        }
+    }
+}
+
 /// One party in the registry.
 ///
 /// `credential_types` means "may issue these types" for every role, and
@@ -108,6 +145,11 @@ pub struct IssuerRecord {
     /// [`crate::Registry::check_x5c`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub x509_certificates: Vec<String>,
+    /// The party's postal address. Optional in the registry, but the ETSI
+    /// TS 119 602 LoTE requires one for every trusted entity, so a party
+    /// without it is left out of `GET /v1/lote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postal_address: Option<PostalAddress>,
     /// Unix seconds of the last write, set by the registry.
     #[serde(default)]
     pub updated_at: u64,

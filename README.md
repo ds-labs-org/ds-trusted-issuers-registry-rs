@@ -306,14 +306,17 @@ LoTEs:
 - `ListAndSchemeInformation`: `LoTEVersionIdentifier` 1,
   `LoTESequenceNumber` = registry version + 1, `LoTEType` (a
   dataspace-defined URI by default, since none of the EU list types fits),
-  the operator's name and address, `ListIssueDateTime`, `NextUpdate` (issue
-  time + snapshot TTL) and the distribution point.
+  the operator's name, postal and electronic address,
+  `StatusDeterminationApproach` (the registry's accreditation chain check),
+  `ListIssueDateTime`, `NextUpdate` (issue time + snapshot TTL) and the
+  distribution point.
 - One `TrustedEntity` per party whose accreditation chain is valid at issue
   time, with one service per credential type it is trusted for
   (`ServiceTypeIdentifier` `#CredentialIssuance` for a TI,
   `#Accreditation` for a TAO), its id in
   `ServiceDigitalIdentity.OtherIds` and its anchors in `X509Certificates`.
-  Suspended, revoked, expired and orphaned parties are left out: outside
+  The standard requires a postal address for every entity, so a party
+  without a `postalAddress` is left out too. Suspended, revoked, expired and orphaned parties are left out: outside
   the Pub-EAA profile, presence in a LoTE means trusted, and there is no
   `ServiceStatus`.
 
@@ -324,6 +327,23 @@ X.509 certificate to put in `x5c`, so a consumer that requires JAdES needs
 a signer in front. The list's addresses default to the https origin of the
 registry's did:web (`--public-base-url` overrides); `--lote-operator-name`,
 `--lote-type` and `--lote-territory` fill the rest.
+
+The operator's postal address has no sensible default, so both endpoints
+answer 503 until `--lote-operator-street`, `--lote-operator-locality` and
+`--lote-operator-country` (plus, optionally, `--lote-operator-postal-code`
+and `--lote-operator-region`) are given. A party's own address is set on
+the record:
+
+```json
+"postalAddress": {
+  "streetAddress": "Rue de la Loi 200", "locality": "Brussels",
+  "postalCode": "1049", "country": "BE"
+}
+```
+
+`streetAddress`, `locality` and `country` (ISO 3166-1 alpha-2) are
+required; `postalCode` and `stateOrProvince` are optional. The graph store
+keeps it as a `schema:PostalAddress`.
 
 ### Signed snapshot
 
@@ -441,6 +461,8 @@ cargo run -p trusted-issuers-http --bin trusted-issuers-registry -- \
 | `--lote-operator-name` | `Dataspace authority` | LoTE `SchemeOperatorName` |
 | `--lote-type` | dataspace-defined URI | LoTE `LoTEType` |
 | `--lote-territory` | none | LoTE `SchemeTerritory` |
+| `--lote-operator-street`, `-locality`, `-country` | none | LoTE operator postal address; `GET /v1/lote` answers 503 without it |
+| `--lote-operator-postal-code`, `-region` | none | optional parts of that address |
 | `--admin-token` / `TRUSTED_ISSUERS_ADMIN_TOKEN` | disabled | bearer token for the admin API |
 | `--snapshot-ttl-secs` | `3600` | snapshot lifetime, at least 1 |
 

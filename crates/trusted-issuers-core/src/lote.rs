@@ -6,7 +6,8 @@
 //! What the list says:
 //!
 //! - One `TrustedEntity` per party whose accreditation chain is valid at
-//!   the list's issue time. Suspended, revoked, expired or orphaned parties
+//!   the list's issue time and that has a postal address (the standard
+//!   requires one for every entity; a party without it is left out). Suspended, revoked, expired or orphaned parties
 //!   are left out: in a LoTE without status (anything but the Pub-EAA
 //!   profile), presence means trusted.
 //! - One `TrustedEntityService` per credential type the party is trusted
@@ -24,7 +25,7 @@
 
 use serde_json::{Value, json};
 
-use crate::model::IdKind;
+use crate::model::{IdKind, PostalAddress};
 use crate::registry::Registry;
 
 /// `LoTEVersionIdentifier` of the lists produced here.
@@ -58,6 +59,32 @@ pub struct LoteOptions {
     pub lote_type: String,
     /// `SchemeTerritory` (ISO 3166-1 alpha-2, or `EU`), when given.
     pub territory: Option<String>,
+    /// The scheme operator's postal address (required by the standard).
+    pub operator_address: PostalAddress,
+}
+
+/// `StatusDeterminationApproach` of the lists produced here: a party is
+/// listed while its accreditation chain in the registry is valid (active,
+/// in its validity window, scoped for the type, up to a Root TAO). The JSON
+/// schema leaves it optional; the standard's XML schema requires it.
+pub const STATUS_DETERMINATION_APPROACH: &str =
+    "https://ds42.org/ontologies/ds-trusted-issuers-registry-rs#AccreditationChainCheck";
+
+/// A postal address in the LoTE's JSON form (English).
+fn postal(address: &PostalAddress) -> Value {
+    let mut out = json!({
+        "lang": "en",
+        "StreetAddress": address.street_address,
+        "Locality": address.locality,
+        "Country": address.country,
+    });
+    if let Some(region) = &address.state_or_province {
+        out["StateOrProvince"] = json!(region);
+    }
+    if let Some(code) = &address.postal_code {
+        out["PostalCode"] = json!(code);
+    }
+    out
 }
 
 /// The LoTE document for `registry` at `now`, next update after `ttl_secs`.
@@ -71,11 +98,12 @@ pub fn build_lote(registry: &Registry, options: &LoteOptions, now: u64, ttl_secs
         "LoTEType": options.lote_type,
         "SchemeOperatorName": en(&options.operator_name),
         "SchemeOperatorAddress": {
-            "SchemeOperatorPostalAddress": [],
+            "SchemeOperatorPostalAddress": [postal(&options.operator_address)],
             "SchemeOperatorElectronicAddress": uri(base),
         },
         "SchemeName": en(&format!("{}: trusted issuers", options.operator_name)),
         "SchemeInformationURI": uri(base),
+        "StatusDeterminationApproach": STATUS_DETERMINATION_APPROACH,
         "ListIssueDateTime": crate::iso8601_utc(now),
         "NextUpdate": crate::iso8601_utc(now.saturating_add(ttl_secs)),
         "DistributionPoints": [format!("{base}/v1/lote")],
@@ -91,6 +119,8 @@ pub fn build_lote(registry: &Registry, options: &LoteOptions, now: u64, ttl_secs
                 .iter()
                 .filter(|t| registry.check(&record.id, t, now).trusted)
                 .collect();
+            // The standard requires every entity's postal address.
+            let address = record.postal_address.as_ref()?;
             if trusted.is_empty() {
                 return None;
             }
@@ -126,7 +156,7 @@ pub fn build_lote(registry: &Registry, options: &LoteOptions, now: u64, ttl_secs
                 "TrustedEntityInformation": {
                     "TEName": en(record.name.as_deref().unwrap_or(&record.id)),
                     "TEAddress": {
-                        "TEPostalAddress": [],
+                        "TEPostalAddress": [postal(address)],
                         "TEElectronicAddress": uri(&web_address),
                     },
                     "TEInformationURI": uri(&record_uri),
@@ -187,7 +217,18 @@ mod tests {
             valid_until: None,
             status: Status::Active,
             x509_certificates: Vec::new(),
+            postal_address: Some(address("1 Example Street")),
             updated_at: 0,
+        }
+    }
+
+    fn address(street: &str) -> PostalAddress {
+        PostalAddress {
+            street_address: street.into(),
+            locality: "Brussels".into(),
+            postal_code: Some("1000".into()),
+            state_or_province: None,
+            country: "BE".into(),
         }
     }
 
@@ -197,6 +238,7 @@ mod tests {
             base_url: "https://registry.example".into(),
             lote_type: DEFAULT_LOTE_TYPE.into(),
             territory: Some("EU".into()),
+            operator_address: address("Rue de la Loi 200"),
         }
     }
 
@@ -245,7 +287,17 @@ mod tests {
             info["SchemeOperatorAddress"]["SchemeOperatorElectronicAddress"][0]["uriValue"],
             "https://registry.example"
         );
-        assert!(info["SchemeOperatorAddress"]["SchemeOperatorPostalAddress"].is_array());
+        assert_eq!(
+            info["SchemeOperatorAddress"]["SchemeOperatorPostalAddress"],
+            json!([{
+                "lang": "en", "StreetAddress": "Rue de la Loi 200", "Locality": "Brussels",
+                "PostalCode": "1000", "Country": "BE"
+            }])
+        );
+        assert_eq!(
+            info["StatusDeterminationApproach"],
+            STATUS_DETERMINATION_APPROACH
+        );
         assert_eq!(info["SchemeName"][0]["lang"], "en");
         assert_eq!(
             info["SchemeInformationURI"][0]["uriValue"],
@@ -258,8 +310,6 @@ mod tests {
             info["DistributionPoints"],
             json!(["https://registry.example/v1/lote"])
         );
-        // No ServiceStatus outside the Pub-EAA profile, so no status approach.
-        assert!(info.get("StatusDeterminationApproach").is_none());
     }
 
     #[test]
@@ -287,7 +337,10 @@ mod tests {
             "https://registry.example/v1/issuers/https%3A%2F%2Fissuer.example%2Ftenants%2Facme"
         );
         assert_eq!(info["TEAddress"]["TEElectronicAddress"][0]["uriValue"], TI);
-        assert!(info["TEAddress"]["TEPostalAddress"].is_array());
+        assert_eq!(
+            info["TEAddress"]["TEPostalAddress"][0]["StreetAddress"],
+            "1 Example Street"
+        );
         let services = ti["TrustedEntityServices"].as_array().unwrap();
         let names: Vec<&str> = services
             .iter()
@@ -344,6 +397,68 @@ mod tests {
         let lote = build_lote(&r, &options(), NOW, 3600);
         let sdi = &entity(&lote, TI).unwrap()["TrustedEntityServices"][0]["ServiceInformation"]["ServiceDigitalIdentity"];
         assert_eq!(sdi["X509Certificates"], json!([{"val": iaca}]));
+    }
+
+    #[test]
+    fn a_party_without_a_postal_address_is_left_out() {
+        let mut r = registry();
+        let mut ti = r.get(TI).unwrap().clone();
+        ti.postal_address = None;
+        r.upsert(ti, 2).unwrap();
+        let lote = build_lote(&r, &options(), NOW, 3600);
+        assert!(entity(&lote, TI).is_none());
+        assert!(entity(&lote, TAO).is_some());
+    }
+
+    #[test]
+    fn postal_addresses_are_checked_on_write() {
+        let mut r = registry();
+        for (bad, why) in [
+            (
+                PostalAddress {
+                    country: "Belgium".into(),
+                    ..address("x")
+                },
+                "country",
+            ),
+            (
+                PostalAddress {
+                    country: "be".into(),
+                    ..address("x")
+                },
+                "country",
+            ),
+            (
+                PostalAddress {
+                    street_address: " ".into(),
+                    ..address("x")
+                },
+                "streetAddress",
+            ),
+            (
+                PostalAddress {
+                    locality: "".into(),
+                    ..address("x")
+                },
+                "locality",
+            ),
+            (
+                PostalAddress {
+                    postal_code: Some("".into()),
+                    ..address("x")
+                },
+                "postalCode",
+            ),
+        ] {
+            let mut ti = r.get(TI).unwrap().clone();
+            ti.postal_address = Some(bad);
+            match r.upsert(ti, 2) {
+                Err(crate::RegistryError::InvalidPostalAddress(m)) => {
+                    assert!(m.contains(why), "{m}")
+                }
+                other => panic!("{why}: {other:?}"),
+            }
+        }
     }
 
     #[test]

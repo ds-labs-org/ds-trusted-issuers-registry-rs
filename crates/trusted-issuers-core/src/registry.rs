@@ -56,6 +56,8 @@ pub enum RegistryError {
     InvalidCertificate { index: usize, reason: String },
     #[error("that X.509 trust anchor is already listed for '{other}'")]
     DuplicateAnchor { other: String },
+    #[error("postalAddress: {0}")]
+    InvalidPostalAddress(&'static str),
 }
 
 /// Outcome of [`Registry::check`].
@@ -224,6 +226,9 @@ impl Registry {
             return Err(RegistryError::NoCredentialTypes);
         }
         crate::x509::check_anchors(self, record)?;
+        if let Some(problem) = record.postal_address.as_ref().and_then(|a| a.problem()) {
+            return Err(RegistryError::InvalidPostalAddress(problem));
+        }
         if record.role != Role::RootTao
             && record
                 .credential_types
@@ -823,6 +828,7 @@ mod tests {
             valid_until: None,
             status: Status::Active,
             x509_certificates: Vec::new(),
+            postal_address: None,
             updated_at: 0,
         }
     }

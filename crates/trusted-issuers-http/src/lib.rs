@@ -53,8 +53,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::RwLock;
 use trusted_issuers_core::{
-    AccreditationError, AuditAction, AuditEntry, AuditRecord, DEFAULT_LOTE_TYPE, IdKind,
-    IssuerRecord, LoteOptions, Registry, RegistryError, Role, Status, build_lote, canonical_id,
+    AccreditationError, AuditAction, AuditEntry, AuditRecord, IdKind, IssuerRecord, LoteOptions,
+    PostalAddress, Registry, RegistryError, Role, Status, build_lote, canonical_id,
     issue_accreditations, sign_lote, sign_snapshot,
 };
 
@@ -74,8 +74,12 @@ pub struct AppState {
     /// gateway after it authenticated them; `None` records every write as
     /// `admin`.
     audit_actor_header: Option<header::HeaderName>,
-    /// Who publishes the LoTE (`GET /v1/lote`) and where.
-    pub lote: LoteOptions,
+    /// Who publishes the LoTE (`GET /v1/lote`) and where. `None` until
+    /// [`AppState::with_lote`] sets it: ETSI TS 119 602 requires the
+    /// operator's postal address, which has no sensible default, so the
+    /// LoTE endpoints answer 503 instead of publishing a non-conformant
+    /// list.
+    pub lote: Option<LoteOptions>,
     pub snapshot_ttl_secs: u64,
 }
 
@@ -90,19 +94,13 @@ impl AppState {
         store: Arc<dyn Store>,
         snapshot_ttl_secs: u64,
     ) -> Self {
-        let key_did = key.own_did.clone();
         Self {
             registry: RwLock::new(registry),
             key,
             admin_token: admin_token.filter(|t| !t.trim().is_empty()),
             store,
             audit_actor_header: None,
-            lote: LoteOptions {
-                operator_name: "Dataspace authority".into(),
-                base_url: base_url_of(&key_did),
-                lote_type: DEFAULT_LOTE_TYPE.into(),
-                territory: None,
-            },
+            lote: None,
             snapshot_ttl_secs,
         }
     }
@@ -122,11 +120,12 @@ impl AppState {
         self
     }
 
-    /// Sets who publishes the LoTE and where (defaults: "Dataspace
-    /// authority", the registry's own `did:web` origin, [`DEFAULT_LOTE_TYPE`],
-    /// no territory).
+    /// Publishes the registry as a LoTE (`GET /v1/lote`), with `lote` saying
+    /// who publishes it and where. Without it the LoTE endpoints answer 503.
+    /// [`trusted_issuers_core::DEFAULT_LOTE_TYPE`] and [`base_url_of`] give the usual type and
+    /// address.
     pub fn with_lote(mut self, lote: LoteOptions) -> Self {
-        self.lote = lote;
+        self.lote = Some(lote);
         self
     }
 
@@ -476,8 +475,20 @@ pub fn base_url_of(did: &str) -> String {
     }
 }
 
-fn current_lote(state: &AppState, registry: &Registry) -> serde_json::Value {
-    build_lote(registry, &state.lote, now_secs(), state.snapshot_ttl_secs)
+/// The current LoTE, or the 503 answered while none is configured.
+async fn current_lote(state: &AppState) -> Result<serde_json::Value, ApiError> {
+    let options = state.lote.as_ref().ok_or_else(|| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the LoTE is not configured: start the registry with the --lote-operator-* options",
+        )
+    })?;
+    Ok(build_lote(
+        &*state.registry.read().await,
+        options,
+        now_secs(),
+        state.snapshot_ttl_secs,
+    ))
 }
 
 /// The cache lifetime of a published list: a quarter of its TTL, as for the
@@ -489,7 +500,10 @@ fn lote_cache_control(state: &AppState) -> String {
 /// `GET /v1/lote`: the registry as an ETSI TS 119 602 List of Trusted
 /// Entities, JSON binding.
 async fn lote(State(state): State<Arc<AppState>>) -> Response {
-    let lote = current_lote(&state, &*state.registry.read().await);
+    let lote = match current_lote(&state).await {
+        Ok(lote) => lote,
+        Err(e) => return e.into_response(),
+    };
     (
         [(header::CACHE_CONTROL, lote_cache_control(&state))],
         Json(lote),
@@ -500,7 +514,10 @@ async fn lote(State(state): State<Arc<AppState>>) -> Response {
 /// `GET /v1/lote.jws`: the same list as a compact JWS signed by the
 /// registry key (`application/jose`).
 async fn lote_signed(State(state): State<Arc<AppState>>) -> Response {
-    let lote = current_lote(&state, &*state.registry.read().await);
+    let lote = match current_lote(&state).await {
+        Ok(lote) => lote,
+        Err(e) => return e.into_response(),
+    };
     (
         [
             (header::CONTENT_TYPE, "application/jose".to_string()),
@@ -553,6 +570,7 @@ struct PutBody {
     status: Status,
     #[serde(default)]
     x509_certificates: Vec<String>,
+    postal_address: Option<PostalAddress>,
     /// Accepted so a GET response can be PUT back; always overwritten.
     #[serde(rename = "updatedAt")]
     _updated_at: Option<u64>,
@@ -584,6 +602,7 @@ async fn put_issuer(
         valid_until: body.valid_until,
         status: body.status,
         x509_certificates: body.x509_certificates,
+        postal_address: body.postal_address,
         updated_at: 0,
     };
     let mut created = false;

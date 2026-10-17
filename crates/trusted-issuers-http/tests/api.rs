@@ -10,9 +10,9 @@ use dcp_core::{DcpKeyPair, find_verifying_key};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use trusted_issuers_core::{snapshot_kid, verify_snapshot};
+use trusted_issuers_core::{DEFAULT_LOTE_TYPE, LoteOptions, snapshot_kid, verify_snapshot};
 use trusted_issuers_http::{
-    AppState, JsonFileStore, MemoryStore, SNAPSHOT_CONTENT_TYPE, Store, load, router,
+    AppState, JsonFileStore, MemoryStore, SNAPSHOT_CONTENT_TYPE, Store, base_url_of, load, router,
 };
 
 const REGISTRY_DID: &str = "did:web:registry.example";
@@ -1342,15 +1342,99 @@ async fn an_issuer_downloads_accreditations_that_verify_offline() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
 
+fn address() -> Value {
+    json!({"streetAddress": "Rue de la Loi 200", "locality": "Brussels", "postalCode": "1049", "country": "BE"})
+}
+
+/// A state that publishes its LoTE, operated from [`address`].
+fn lote_state() -> Arc<AppState> {
+    let s = Arc::try_unwrap(state(Some(TOKEN), None)).ok().unwrap();
+    let lote = LoteOptions {
+        operator_name: "Dataspace authority".into(),
+        operator_address: serde_json::from_value(address()).unwrap(),
+        base_url: base_url_of(REGISTRY_DID),
+        lote_type: DEFAULT_LOTE_TYPE.into(),
+        territory: None,
+    };
+    Arc::new(s.with_lote(lote))
+}
+
+/// Gives every party a postal address, by putting back what GET returns.
+async fn add_addresses(s: &Arc<AppState>) {
+    let (_, body, _) = call(s, "GET", "/v1/issuers", None, None).await;
+    for mut record in body["items"].as_array().unwrap().clone() {
+        record["postalAddress"] = address();
+        let path = record["id"]
+            .as_str()
+            .unwrap()
+            .replace('%', "%25")
+            .replace('/', "%2F");
+        let (status, body, _) = call(
+            s,
+            "PUT",
+            &format!("/v1/issuers/{path}"),
+            Some(TOKEN),
+            Some(record),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn the_lote_is_disabled_without_an_operator_address() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    for uri in ["/v1/lote", "/v1/lote.jws"] {
+        let (status, body, _) = call(&s, "GET", uri, None, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn postal_addresses_are_stored_and_checked() {
+    let s = state(Some(TOKEN), None);
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{ROOT}"),
+        Some(TOKEN),
+        Some(json!({"role": "root_tao", "credentialTypes": ["*"], "status": "active", "postalAddress": address()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["postalAddress"], address());
+    let mut bad = address();
+    bad["country"] = json!("Belgium");
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{ROOT}"),
+        Some(TOKEN),
+        Some(json!({"role": "root_tao", "credentialTypes": ["*"], "status": "active", "postalAddress": bad})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.to_string().contains("postalAddress"), "{body}");
+}
+
 #[tokio::test]
 async fn the_registry_is_published_as_a_signed_lote() {
-    let s = state(Some(TOKEN), None);
+    let s = lote_state();
     seed_with_oid4vci(&s).await;
+    let (_, lote, _) = call(&s, "GET", "/v1/lote", None, None).await;
+    // A party without a postal address cannot be listed.
+    assert_eq!(lote["LoTE"]["TrustedEntitiesList"], json!([]));
+    add_addresses(&s).await;
     let (status, lote, content_type) = call(&s, "GET", "/v1/lote", None, None).await;
     assert_eq!(status, StatusCode::OK, "{lote}");
     assert_eq!(content_type.as_deref(), Some("application/json"));
     let info = &lote["LoTE"]["ListAndSchemeInformation"];
-    assert_eq!(info["LoTESequenceNumber"], 6);
+    assert_eq!(info["LoTESequenceNumber"], 11);
+    assert_eq!(
+        info["SchemeOperatorAddress"]["SchemeOperatorPostalAddress"][0]["Locality"],
+        "Brussels"
+    );
     // The registry's own did:web origin is the scheme's address.
     assert_eq!(
         info["DistributionPoints"],

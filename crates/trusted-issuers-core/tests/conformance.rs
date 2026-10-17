@@ -13,7 +13,9 @@
 use std::path::PathBuf;
 
 use serde_json::Value;
-use trusted_issuers_core::{IssuerRecord, LoteOptions, Registry, Role, Status, build_lote};
+use trusted_issuers_core::{
+    IssuerRecord, LoteOptions, PostalAddress, Registry, Role, Status, build_lote,
+};
 
 const NOW: u64 = 1_792_000_000;
 
@@ -47,6 +49,7 @@ fn record(id: &str, role: Role, types: &[&str], by: Option<&str>) -> IssuerRecor
         valid_until: None,
         status: Status::Active,
         x509_certificates: Vec::new(),
+        postal_address: Some(address()),
         updated_at: 0,
     }
 }
@@ -104,12 +107,23 @@ fn self_signed_ca() -> String {
     base64::engine::general_purpose::STANDARD.encode(cert.der())
 }
 
+fn address() -> PostalAddress {
+    PostalAddress {
+        street_address: "Rue de la Loi 200".into(),
+        locality: "Brussels".into(),
+        postal_code: Some("1049".into()),
+        state_or_province: None,
+        country: "BE".into(),
+    }
+}
+
 fn lote_options() -> LoteOptions {
     LoteOptions {
         operator_name: "Example Dataspace Authority".into(),
         base_url: "https://registry.example".into(),
         lote_type: trusted_issuers_core::DEFAULT_LOTE_TYPE.into(),
         territory: Some("EU".into()),
+        operator_address: address(),
     }
 }
 

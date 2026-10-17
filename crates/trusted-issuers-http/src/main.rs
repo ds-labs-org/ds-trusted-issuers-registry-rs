@@ -8,7 +8,7 @@ use dcp_core::DcpKeyPair;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey;
 use trusted_issuers_contreforts::{ISSUER_RECORD_KIND, RegistryGraphConnector};
-use trusted_issuers_core::{is_did_web_port, is_dns_name};
+use trusted_issuers_core::{PostalAddress, is_did_web_port, is_dns_name};
 use trusted_issuers_http::{AppState, GraphStore, JsonFileStore, MemoryStore, Store, router};
 
 /// Trusted issuers registry: which DIDs may issue which credential types in
@@ -73,6 +73,30 @@ struct Cli {
     /// `SchemeOperatorName` of the published LoTE (`GET /v1/lote`).
     #[arg(long, default_value = "Dataspace authority")]
     lote_operator_name: String,
+
+    /// Street of the LoTE scheme operator's postal address. ETSI TS 119 602
+    /// requires one, so `GET /v1/lote` answers 503 until the street, the
+    /// locality and the country are all given.
+    #[arg(long, requires_all = ["lote_operator_locality", "lote_operator_country"])]
+    lote_operator_street: Option<String>,
+
+    /// Locality (city) of the LoTE scheme operator's postal address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_locality: Option<String>,
+
+    /// Postal code of the LoTE scheme operator's postal address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_postal_code: Option<String>,
+
+    /// State, province or region of the LoTE scheme operator's postal
+    /// address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_region: Option<String>,
+
+    /// Country (ISO 3166-1 alpha-2) of the LoTE scheme operator's postal
+    /// address.
+    #[arg(long, requires = "lote_operator_street")]
+    lote_operator_country: Option<String>,
 
     /// `LoTEType` URI of the published LoTE.
     #[arg(long, default_value = trusted_issuers_core::DEFAULT_LOTE_TYPE)]
@@ -139,6 +163,29 @@ fn key_pair(did: String, signing_key: SigningKey) -> DcpKeyPair {
     }
 }
 
+/// The LoTE operator's postal address from the `--lote-operator-*` flags,
+/// `None` when none is given, checked like any party's address.
+fn operator_address(cli: &Cli) -> Result<Option<PostalAddress>, String> {
+    let (Some(street), Some(locality), Some(country)) = (
+        &cli.lote_operator_street,
+        &cli.lote_operator_locality,
+        &cli.lote_operator_country,
+    ) else {
+        return Ok(None);
+    };
+    let address = PostalAddress {
+        street_address: street.clone(),
+        locality: locality.clone(),
+        postal_code: cli.lote_operator_postal_code.clone(),
+        state_or_province: cli.lote_operator_region.clone(),
+        country: country.clone(),
+    };
+    match address.problem() {
+        Some(problem) => Err(format!("LoTE operator address: {problem}")),
+        None => Ok(Some(address)),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     tracing_subscriber::fmt()
@@ -147,6 +194,8 @@ async fn main() -> Result<(), String> {
         )
         .init();
     let cli = Cli::parse();
+    // Checked before anything is opened, so a bad address fails fast.
+    let operator_address = operator_address(&cli)?;
 
     let did = did_from_host(&cli.did_host)?;
     let key = match &cli.signing_key_file {
@@ -207,12 +256,20 @@ async fn main() -> Result<(), String> {
         .public_base_url
         .clone()
         .unwrap_or_else(|| trusted_issuers_http::base_url_of(&state.key.own_did));
-    state = state.with_lote(trusted_issuers_core::LoteOptions {
-        operator_name: cli.lote_operator_name.clone(),
-        base_url,
-        lote_type: cli.lote_type.clone(),
-        territory: cli.lote_territory.clone(),
-    });
+    match operator_address {
+        Some(operator_address) => {
+            state = state.with_lote(trusted_issuers_core::LoteOptions {
+                operator_name: cli.lote_operator_name.clone(),
+                operator_address,
+                base_url,
+                lote_type: cli.lote_type.clone(),
+                territory: cli.lote_territory.clone(),
+            });
+        }
+        None => tracing::warn!(
+            "no LoTE operator address configured (--lote-operator-street, -locality, -country): GET /v1/lote is disabled"
+        ),
+    }
     let state = Arc::new(state);
     if !state.admin_enabled() {
         tracing::warn!("no (or an empty) admin token configured: the admin API is disabled");
@@ -325,5 +382,44 @@ mod tests {
         // host, which is why this checks the advice and not for "443".
         let err = did_from_host("0x7f000001:443").unwrap_err();
         assert!(!err.contains("omit"), "{err}");
+    }
+
+    #[test]
+    fn the_lote_operator_address_comes_from_its_flags() {
+        use super::{Cli, operator_address};
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let args = ["registry", "--did-host", "registry.example"];
+            Cli::try_parse_from(args.iter().chain(extra))
+        };
+        assert_eq!(operator_address(&parse(&[]).unwrap()), Ok(None));
+        let cli = parse(&[
+            "--lote-operator-street",
+            "Rue de la Loi 200",
+            "--lote-operator-locality",
+            "Brussels",
+            "--lote-operator-postal-code",
+            "1049",
+            "--lote-operator-country",
+            "BE",
+        ])
+        .unwrap();
+        let address = operator_address(&cli).unwrap().unwrap();
+        assert_eq!(address.locality, "Brussels");
+        assert_eq!(address.postal_code.as_deref(), Some("1049"));
+        // Street, locality and country go together.
+        assert!(parse(&["--lote-operator-street", "Rue de la Loi 200"]).is_err());
+        assert!(parse(&["--lote-operator-country", "BE"]).is_err());
+        let cli = parse(&[
+            "--lote-operator-street",
+            "Rue de la Loi 200",
+            "--lote-operator-locality",
+            "Brussels",
+            "--lote-operator-country",
+            "Belgium",
+        ])
+        .unwrap();
+        let err = operator_address(&cli).unwrap_err();
+        assert!(err.contains("ISO 3166-1"), "{err}");
     }
 }
