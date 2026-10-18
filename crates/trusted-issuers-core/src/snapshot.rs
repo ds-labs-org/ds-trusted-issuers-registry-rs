@@ -9,7 +9,7 @@
 //!
 //! ```json
 //! { "iss": "did:web:registry.example", "iat": 1760000000, "exp": 1760003600,
-//!   "version": 42, "issuers": [ { "did": "...", "role": "ti", ... } ] }
+//!   "version": 42, "issuers": [ { "id": "...", "role": "ti", ... } ] }
 //! ```
 
 use dcp_core::{DcpKeyPair, decode_jws_unverified, verify_jws_signature};
@@ -66,17 +66,17 @@ pub fn sign_snapshot(registry: &Registry, key: &DcpKeyPair, now: u64, ttl_secs: 
         issuers: registry.list().cloned().collect(),
     };
     let payload = serde_json::to_value(&payload).expect("snapshot payload always serializes");
-    sign_with_typ(&payload, key)
+    sign_with_typ(&payload, key, SNAPSHOT_TYP)
 }
 
 /// Same as `dcp_core::sign_jws`, plus a `typ` header (which `sign_jws`
 /// does not let the caller set).
-fn sign_with_typ(payload: &serde_json::Value, key: &DcpKeyPair) -> String {
+pub(crate) fn sign_with_typ(payload: &serde_json::Value, key: &DcpKeyPair, typ: &str) -> String {
     use dcp_core::b64_encode;
     use p256::ecdsa::Signature;
     use p256::ecdsa::signature::Signer;
 
-    let header = serde_json::json!({"kid": key.own_key_id, "alg": "ES256", "typ": SNAPSHOT_TYP});
+    let header = serde_json::json!({"kid": key.own_key_id, "alg": "ES256", "typ": typ});
     let signing_input = format!(
         "{}.{}",
         b64_encode(header.to_string()),
@@ -99,7 +99,7 @@ pub struct TrustList {
 }
 
 impl TrustList {
-    pub fn check(&self, did: &str, credential_type: &str, now: u64) -> TrustDecision {
+    pub fn check(&self, id: &str, credential_type: &str, now: u64) -> TrustDecision {
         if now >= self.exp {
             return TrustDecision {
                 trusted: false,
@@ -110,7 +110,29 @@ impl TrustList {
                 )),
             };
         }
-        self.registry.check(did, credential_type, now)
+        self.registry.check(id, credential_type, now)
+    }
+
+    /// [`Registry::check_x5c`] against the snapshot, refused once it
+    /// expired, like [`TrustList::check`].
+    pub fn check_x5c(
+        &self,
+        x5c: &[String],
+        credential_type: &str,
+        now: u64,
+        eku: Option<&str>,
+    ) -> TrustDecision {
+        if now >= self.exp {
+            return TrustDecision {
+                trusted: false,
+                chain: vec![],
+                reason: Some(format!(
+                    "the trust list expired at {}; fetch a new snapshot",
+                    self.exp
+                )),
+            };
+        }
+        self.registry.check_x5c(x5c, credential_type, now, eku)
     }
 
     pub fn registry(&self) -> &Registry {
@@ -162,7 +184,7 @@ pub fn verify_snapshot(
     }
     let mut issuers = std::collections::BTreeMap::new();
     for record in payload.issuers {
-        let did = record.did.clone();
+        let did = record.id.clone();
         if issuers.insert(did.clone(), record).is_some() {
             return Err(SnapshotError::Malformed(format!(
                 "'{did}' is listed more than once"
@@ -205,7 +227,7 @@ mod tests {
         let mut r = Registry::default();
         r.upsert(
             IssuerRecord {
-                did: "did:web:authority.example".into(),
+                id: "did:web:authority.example".into(),
                 role: Role::RootTao,
                 name: Some("Authority".into()),
                 credential_types: vec!["*".into()],
@@ -213,6 +235,8 @@ mod tests {
                 valid_from: None,
                 valid_until: None,
                 status: Status::Active,
+                x509_certificates: Vec::new(),
+                postal_address: None,
                 updated_at: 0,
             },
             1,
@@ -254,7 +278,7 @@ mod tests {
             version: 1,
             issuers: registry().list().cloned().collect(),
         };
-        sign_with_typ(&serde_json::to_value(&payload).unwrap(), key)
+        sign_with_typ(&serde_json::to_value(&payload).unwrap(), key, SNAPSHOT_TYP)
     }
 
     #[test]

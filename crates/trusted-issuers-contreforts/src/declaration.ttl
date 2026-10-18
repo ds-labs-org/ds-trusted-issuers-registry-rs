@@ -1,0 +1,68 @@
+########################################################################
+# ds-trusted-issuers-registry-rs -- self-description for Contreforts'
+# connector interface
+#
+# Modelled on ds-identity-hub-rs/crates/identity-hub-contreforts/src/
+# declaration.ttl (itself modelled on ds-sql-dps-rs's): extension vocabulary
+# and fields live in this connector's own namespace, never under
+# Contreforts' shared core: namespace.
+#
+# Neither entity this connector serves ("a party in the dataspace's trusted
+# issuers registry", "one audited registry write") has a good alignment
+# target among core's business-sync concepts (customer, invoice, project,
+# ...), so both are declared with no skos:closeMatch/exactMatch rather than
+# forced into a mismatched one, as the hub's declaration does.
+########################################################################
+
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+
+@prefix tir: <https://ds42.org/ontologies/ds-trusted-issuers-registry-rs#> .
+@prefix contreforts: <https://contreforts.ds-labs.org/ontologies/declaration#> .
+
+########################################################################
+# Entity vocabulary
+########################################################################
+
+tir:IssuerRecord a rdfs:Class ;
+    rdfs:label "Trusted issuer record" ;
+    rdfs:comment """One party in the dataspace authority's trusted issuers
+registry (EBSI-style accreditation tier: root_tao, tao or ti), named by a
+DID (DCP issuers) or an OID4VCI credential issuer URL, with the credential
+types it may issue or accredit, its accreditor, validity window and status.
+Lives in the registry graph (trusted-issuers-graph); keyed by EntityKind
+"ds-trusted-issuers-registry-rs:issuer-record", remote_id = the party's
+id.""" .
+
+tir:AuditEntry a rdfs:Class ;
+    rdfs:label "Registry audit entry" ;
+    rdfs:comment """One write to the trusted issuers registry (a prov:Activity):
+who made it, what it did, the record before and after, and its place in the
+audit log's hash chain. Keyed by EntityKind
+"ds-trusted-issuers-registry-rs:audit-entry", remote_id = its sequence
+number.""" .
+
+########################################################################
+# Configuration schema
+#
+# One registry graph per running registry, so there is nothing to route
+# between; this one field exists so the declaration carries a real,
+# meta-shape-valid connector shape, as the hub's declaration does.
+########################################################################
+
+tir:RegistryGraphConnectorShape a sh:NodeShape ;
+    sh:targetClass tir:RegistryGraphConnector ;
+    contreforts:category "dataspace" ;
+
+    sh:property [
+        sh:path tir:graphSource ;
+        sh:name "Graph source" ;
+        sh:description "Identifies which in-process registry graph this connector serves. A running registry always has exactly one, named 'primary'." ;
+        sh:datatype xsd:string ;
+        sh:nodeKind sh:Literal ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:order 1 ;
+    ] .
