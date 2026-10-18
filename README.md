@@ -511,12 +511,6 @@ cargo run -p trusted-issuers-http --bin trusted-issuers-registry -- \
 
 ## Not done yet
 
-- `ds-identity-hub-rs` checking credentials against the registry
-  (snapshot-backed, by issuer and credential type, behind its
-  `trusted-issuers-registry` Cargo feature) is on that repository's
-  `ccr-180333f6-p88qlb` branch, and the governance console's support for
-  the new fields and endpoints on `ds-authority-governance-ui`'s; both pin
-  this branch until it merges.
 - A JAdES baseline signature on the LoTE (it needs an X.509 signing
   certificate), `ServiceHistory`, and the Pub-EAA profile's
   `ServiceStatus`.
@@ -525,3 +519,12 @@ cargo run -p trusted-issuers-http --bin trusted-issuers-registry -- \
   than by the registry.
 - Storage shared by several registry instances: both durable stores are
   single-process.
+
+## License
+
+GNU Affero General Public License, version 3 only (`AGPL-3.0-only`, see
+[LICENSE](LICENSE)). Beyond the GPL's terms, section 13 requires anyone who
+runs a modified registry as a network service to offer its users the
+modified source. The vendored `vendor/contreforts-core` keeps its own
+licence (MIT), and the conformance material is downloaded at test time
+under its own licences (see [Conformance](#conformance)).
