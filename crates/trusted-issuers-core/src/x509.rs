@@ -523,6 +523,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_chain_is_judged_by_the_party_whose_anchor_is_nearest_the_leaf() {
+        // A TAO lists its root CA, and the issuer it accredits lists the
+        // issuing CA that root signed. A document signer under the issuing
+        // CA validates against both anchors; it is the issuer's.
+        let root_ca = ca("National root CA", None);
+        let issuing_ca = ca("Agency issuing CA", Some(&root_ca));
+        let (tao, ti) = ("https://a-tao.example", "https://b-agency.example");
+        let mdl = "org.iso.18013.5.1.mDL";
+        let mut registry = Registry::default();
+        for r in [
+            record(ROOT, Role::RootTao, &["*"], None, vec![]),
+            record(tao, Role::Tao, &[mdl], Some(ROOT), vec![b64(root_ca.der())]),
+            record(ti, Role::Ti, &[mdl], Some(tao), vec![b64(issuing_ca.der())]),
+        ] {
+            registry.upsert(r, 1).unwrap();
+        }
+        let x5c = vec![
+            leaf(&issuing_ca, None, (2030, 1, 1)),
+            b64(issuing_ca.der()),
+        ];
+        let d = registry.check_x5c(&x5c, mdl, NOW, None);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec![ti, tao, ROOT]);
+        // Suspending the issuer distrusts its certificates, whatever the
+        // TAO's broader anchor says.
+        registry.set_status(ti, Status::Suspended, 2).unwrap();
+        let d = registry.check_x5c(&x5c, mdl, NOW, None);
+        assert!(!d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec![ti]);
+    }
+
+    #[test]
     fn anchors_are_checked_on_write() {
         let p = pki();
         let iaca = b64(p.iaca.der());
