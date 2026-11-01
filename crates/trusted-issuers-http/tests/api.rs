@@ -1177,6 +1177,38 @@ async fn the_graph_store_keeps_the_registry_and_its_audit_log_across_restarts() 
     assert_eq!(body["head"]["seq"], 6);
 }
 
+/// The graph store reloads through the same revalidation as the data file:
+/// a narrowed accreditor leaves a graph the registry can reopen, with the
+/// out-of-scope dependent denied.
+#[tokio::test]
+async fn narrowing_an_accreditor_keeps_the_graph_reopenable() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = graph_state(dir.path(), None);
+    seed(&s).await;
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{TAO}"),
+        Some(TOKEN),
+        Some(json!({"role": "tao", "credentialTypes": ["DataProcessorCredential"], "accreditedBy": ROOT, "status": "active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, before, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    drop(s);
+
+    let s = graph_state(dir.path(), None);
+    let (_, after, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(after, before);
+    let decision = s
+        .registry
+        .read()
+        .await
+        .check(TI, "MembershipCredential", dcp_core::now_secs());
+    assert!(!decision.trusted);
+    assert_eq!(decision.chain, vec![TI, TAO]);
+}
+
 #[tokio::test]
 async fn a_json_data_file_is_imported_into_an_empty_graph_once() {
     let dir = tempfile::tempdir().unwrap();
