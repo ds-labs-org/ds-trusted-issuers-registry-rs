@@ -1,0 +1,26 @@
+# Tracks issue #15: Norway's EU trusted list is signed with a 2032-bit RSA key,
+# which we accept only through the temporary `rsa-verify-2032` feature.
+# Green while that is still true. Red, with an explicit message, once Norway
+# re-signs with a >= 2048-bit or non-RSA key: then drop the feature.
+name: NO trusted list signer key
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/no_tl_signer_key.py
+      - .github/workflows/no-tl-signer-key.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Norway's trusted list signer key
+        run: python3 scripts/no_tl_signer_key.py
