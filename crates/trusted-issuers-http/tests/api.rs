@@ -1252,6 +1252,19 @@ mod pki {
         CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
     }
 
+    /// A CA certified by `parent` (an issuing CA under a root).
+    pub fn issuing_ca(
+        parent: &CertifiedIssuer<'static, KeyPair>,
+    ) -> CertifiedIssuer<'static, KeyPair> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Example issuing CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), parent).unwrap()
+    }
+
     /// An mDL document signer certificate issued by `iaca`.
     pub fn document_signer(iaca: &CertifiedIssuer<'static, KeyPair>) -> String {
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -1323,6 +1336,61 @@ async fn x5c_chains_are_checked_against_listed_trust_anchors() {
         let (status, _, _) = call(&s, "POST", "/v1/x509/check", None, Some(bad.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
     }
+}
+
+#[tokio::test]
+async fn a_suspended_issuer_s_certificates_are_refused_under_its_tao_s_root_anchor() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    // The TAO lists its root CA, the issuer it accredits the issuing CA
+    // under that root.
+    let root_ca = pki::iaca();
+    let issuing_ca = pki::issuing_ca(&root_ca);
+    for (path, body) in [
+        (
+            "https:%2F%2Fa-tao.example",
+            json!({"role": "tao", "credentialTypes": [MDL], "accreditedBy": ROOT,
+                   "status": "active", "x509Certificates": [pki::b64(root_ca.der())]}),
+        ),
+        (
+            "https:%2F%2Fb-agency.example",
+            json!({"role": "ti", "credentialTypes": [MDL], "accreditedBy": "https://a-tao.example",
+                   "status": "active", "x509Certificates": [pki::b64(issuing_ca.der())]}),
+        ),
+    ] {
+        let (status, body, _) = call(
+            &s,
+            "PUT",
+            &format!("/v1/issuers/{path}"),
+            Some(TOKEN),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let check = json!({
+        "x5c": [pki::document_signer(&issuing_ca), pki::b64(issuing_ca.der())],
+        "credentialType": MDL,
+    });
+    let (_, body, _) = call(&s, "POST", "/v1/x509/check", None, Some(check.clone())).await;
+    assert_eq!(body["trusted"], true, "{body}");
+    assert_eq!(
+        body["chain"],
+        json!(["https://b-agency.example", "https://a-tao.example", ROOT])
+    );
+
+    let (status, body, _) = call(
+        &s,
+        "PATCH",
+        "/v1/issuers/https:%2F%2Fb-agency.example/status",
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body, _) = call(&s, "POST", "/v1/x509/check", None, Some(check)).await;
+    assert_eq!(body["trusted"], false, "{body}");
+    assert_eq!(body["chain"], json!(["https://b-agency.example"]));
 }
 
 #[tokio::test]
