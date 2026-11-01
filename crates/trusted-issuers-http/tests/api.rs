@@ -299,6 +299,47 @@ async fn writes_are_persisted_and_reloaded() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Narrowing an accreditor's scope is an accepted write that leaves its
+/// existing dependents out of scope. The registry must still restart from
+/// its own data file and its snapshots must still verify; `check` is what
+/// denies the out-of-scope dependents.
+#[tokio::test]
+async fn narrowing_an_accreditor_keeps_the_data_file_and_snapshots_usable() {
+    let dir = std::env::temp_dir().join(format!("tir-narrow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("registry.json");
+    let _ = std::fs::remove_file(&file);
+
+    let s = state(Some(TOKEN), Some(file.clone()));
+    seed(&s).await;
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{TAO}"),
+        Some(TOKEN),
+        Some(json!({"role": "tao", "credentialTypes": ["DataProcessorCredential"], "accreditedBy": ROOT, "status": "active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let reloaded = load(&file, false).expect("the registry restarts from its own file");
+    assert_eq!(reloaded, *s.registry.read().await);
+
+    let (status, token, _) = call(&s, "GET", "/v1/snapshot", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let token = token.as_str().unwrap();
+    let (_, doc, _) = call(&s, "GET", "/.well-known/did.json", None, None).await;
+    let doc = serde_json::from_value(doc).unwrap();
+    let key = find_verifying_key(&doc, &snapshot_kid(token).unwrap()).unwrap();
+    let now = dcp_core::now_secs();
+    let list = verify_snapshot(token, REGISTRY_DID, &key, now).expect("the snapshot verifies");
+    let decision = list.check(TI, "MembershipCredential", now);
+    assert!(!decision.trusted);
+    assert_eq!(decision.chain, vec![TI, TAO]);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn an_empty_admin_token_disables_the_admin_api() {
     let body = json!({"role": "root_tao", "credentialTypes": ["*"], "status": "active"});
@@ -1136,6 +1177,38 @@ async fn the_graph_store_keeps_the_registry_and_its_audit_log_across_restarts() 
     assert_eq!(body["head"]["seq"], 6);
 }
 
+/// The graph store reloads through the same revalidation as the data file:
+/// a narrowed accreditor leaves a graph the registry can reopen, with the
+/// out-of-scope dependent denied.
+#[tokio::test]
+async fn narrowing_an_accreditor_keeps_the_graph_reopenable() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = graph_state(dir.path(), None);
+    seed(&s).await;
+    let (status, body, _) = call(
+        &s,
+        "PUT",
+        &format!("/v1/issuers/{TAO}"),
+        Some(TOKEN),
+        Some(json!({"role": "tao", "credentialTypes": ["DataProcessorCredential"], "accreditedBy": ROOT, "status": "active"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, before, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    drop(s);
+
+    let s = graph_state(dir.path(), None);
+    let (_, after, _) = call(&s, "GET", "/v1/issuers", None, None).await;
+    assert_eq!(after, before);
+    let decision = s
+        .registry
+        .read()
+        .await
+        .check(TI, "MembershipCredential", dcp_core::now_secs());
+    assert!(!decision.trusted);
+    assert_eq!(decision.chain, vec![TI, TAO]);
+}
+
 #[tokio::test]
 async fn a_json_data_file_is_imported_into_an_empty_graph_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -1177,6 +1250,19 @@ mod pki {
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
+    }
+
+    /// A CA certified by `parent` (an issuing CA under a root).
+    pub fn issuing_ca(
+        parent: &CertifiedIssuer<'static, KeyPair>,
+    ) -> CertifiedIssuer<'static, KeyPair> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Example issuing CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), parent).unwrap()
     }
 
     /// An mDL document signer certificate issued by `iaca`.
@@ -1250,6 +1336,61 @@ async fn x5c_chains_are_checked_against_listed_trust_anchors() {
         let (status, _, _) = call(&s, "POST", "/v1/x509/check", None, Some(bad.clone())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
     }
+}
+
+#[tokio::test]
+async fn a_suspended_issuer_s_certificates_are_refused_under_its_tao_s_root_anchor() {
+    let s = state(Some(TOKEN), None);
+    seed(&s).await;
+    // The TAO lists its root CA, the issuer it accredits the issuing CA
+    // under that root.
+    let root_ca = pki::iaca();
+    let issuing_ca = pki::issuing_ca(&root_ca);
+    for (path, body) in [
+        (
+            "https:%2F%2Fa-tao.example",
+            json!({"role": "tao", "credentialTypes": [MDL], "accreditedBy": ROOT,
+                   "status": "active", "x509Certificates": [pki::b64(root_ca.der())]}),
+        ),
+        (
+            "https:%2F%2Fb-agency.example",
+            json!({"role": "ti", "credentialTypes": [MDL], "accreditedBy": "https://a-tao.example",
+                   "status": "active", "x509Certificates": [pki::b64(issuing_ca.der())]}),
+        ),
+    ] {
+        let (status, body, _) = call(
+            &s,
+            "PUT",
+            &format!("/v1/issuers/{path}"),
+            Some(TOKEN),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let check = json!({
+        "x5c": [pki::document_signer(&issuing_ca), pki::b64(issuing_ca.der())],
+        "credentialType": MDL,
+    });
+    let (_, body, _) = call(&s, "POST", "/v1/x509/check", None, Some(check.clone())).await;
+    assert_eq!(body["trusted"], true, "{body}");
+    assert_eq!(
+        body["chain"],
+        json!(["https://b-agency.example", "https://a-tao.example", ROOT])
+    );
+
+    let (status, body, _) = call(
+        &s,
+        "PATCH",
+        "/v1/issuers/https:%2F%2Fb-agency.example/status",
+        Some(TOKEN),
+        Some(json!({"status": "suspended"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body, _) = call(&s, "POST", "/v1/x509/check", None, Some(check)).await;
+    assert_eq!(body["trusted"], false, "{body}");
+    assert_eq!(body["chain"], json!(["https://b-agency.example"]));
 }
 
 #[tokio::test]

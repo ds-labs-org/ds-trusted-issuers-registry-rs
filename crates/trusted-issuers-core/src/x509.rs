@@ -8,7 +8,8 @@
 //! finds the record whose anchor the presented chain validates against
 //! (with `rustls-webpki`: signatures, validity periods, CA constraints,
 //! path length and name constraints, and optionally an extended key usage),
-//! then runs the ordinary accreditation-chain check on that record. webpki
+//! the one nearest the leaf when several do, then runs the ordinary
+//! accreditation-chain check on that record. webpki
 //! takes an anchor as given, so the registry adds two checks of its own: an
 //! anchor must be a CA certificate (checked on write) and inside its
 //! validity period (checked at `now`). Both
@@ -199,6 +200,14 @@ impl Registry {
     /// [`Registry::check`]. With `eku` (a dotted OID), the leaf must carry
     /// that extended key usage; without it any (or no) EKU is accepted.
     ///
+    /// When the chain validates against the anchors of several records (a
+    /// TAO lists its root CA, the issuer it accredits the issuing CA under
+    /// it), the record whose anchor is nearest the leaf (fewest
+    /// intermediates on the validated path) is the issuer and its check
+    /// decides: suspending that issuer distrusts its certificates whatever a
+    /// broader anchor says. Two records at the same distance leave the
+    /// issuer ambiguous, which is not trusted.
+    ///
     /// On success the decision's chain starts at the matched record's id.
     pub fn check_x5c(
         &self,
@@ -247,6 +256,10 @@ impl Registry {
         let time = UnixTime::since_unix_epoch(Duration::from_secs(now));
         let mut last_error = None;
         let mut listed = false;
+        // The record whose anchor is nearest the leaf so far, with its
+        // distance, and whether another record is as near.
+        let mut nearest: Option<(usize, &IssuerRecord)> = None;
+        let mut tied = false;
         for record in self.list().filter(|r| !r.x509_certificates.is_empty()) {
             listed = true;
             let ders: Vec<CertificateDer<'static>> = record
@@ -272,9 +285,27 @@ impl Registry {
                 None,
                 None,
             ) {
-                Ok(_) => return self.check(&record.id, credential_type, now),
+                Ok(path) => {
+                    let distance = path.intermediate_certificates().count();
+                    match nearest {
+                        Some((best, _)) if best < distance => {}
+                        Some((best, _)) if best == distance => tied = true,
+                        _ => {
+                            nearest = Some((distance, record));
+                            tied = false;
+                        }
+                    }
+                }
                 Err(e) => last_error = Some(e),
             }
+        }
+        if let Some((_, record)) = nearest {
+            if tied {
+                return untrusted(
+                    "the certificate chain validates against the anchors of more than one party at the same distance",
+                );
+            }
+            return self.check(&record.id, credential_type, now);
         }
         untrusted(match last_error {
             None if listed => "no listed trust anchor is valid at this time".to_string(),
@@ -520,6 +551,79 @@ pub(crate) mod tests {
             .check_x5c(&[ds], "org.iso.18013.5.1.mDL", NOW, None);
         assert!(!d.trusted);
         assert_eq!(d.chain, vec![MDL_ISSUER, ROOT]);
+    }
+
+    #[test]
+    fn a_chain_is_judged_by_the_party_whose_anchor_is_nearest_the_leaf() {
+        // A TAO lists its root CA, and the issuer it accredits lists the
+        // issuing CA that root signed. A document signer under the issuing
+        // CA validates against both anchors; it is the issuer's.
+        let root_ca = ca("National root CA", None);
+        let issuing_ca = ca("Agency issuing CA", Some(&root_ca));
+        let (tao, ti) = ("https://a-tao.example", "https://b-agency.example");
+        let mdl = "org.iso.18013.5.1.mDL";
+        let mut registry = Registry::default();
+        for r in [
+            record(ROOT, Role::RootTao, &["*"], None, vec![]),
+            record(tao, Role::Tao, &[mdl], Some(ROOT), vec![b64(root_ca.der())]),
+            record(ti, Role::Ti, &[mdl], Some(tao), vec![b64(issuing_ca.der())]),
+        ] {
+            registry.upsert(r, 1).unwrap();
+        }
+        let x5c = vec![leaf(&issuing_ca, None, (2030, 1, 1)), b64(issuing_ca.der())];
+        let d = registry.check_x5c(&x5c, mdl, NOW, None);
+        assert!(d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec![ti, tao, ROOT]);
+        // Suspending the issuer distrusts its certificates, whatever the
+        // TAO's broader anchor says.
+        registry.set_status(ti, Status::Suspended, 2).unwrap();
+        let d = registry.check_x5c(&x5c, mdl, NOW, None);
+        assert!(!d.trusted, "{d:?}");
+        assert_eq!(d.chain, vec![ti]);
+    }
+
+    #[test]
+    fn two_parties_as_near_the_leaf_leave_the_issuer_ambiguous() {
+        // The same CA key and name, certified twice (a re-issued root): two
+        // different anchors that both validate the same leaf directly.
+        let key = KeyPair::generate().unwrap();
+        let reissue = |not_after: (i32, u8, u8)| {
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "Shared CA");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+            params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+            let key = KeyPair::from_pem(&key.serialize_pem()).unwrap();
+            CertifiedIssuer::self_signed(params, key).unwrap()
+        };
+        let (first, second) = (reissue((2035, 1, 1)), reissue((2036, 1, 1)));
+        let mdl = "org.iso.18013.5.1.mDL";
+        let mut registry = Registry::default();
+        for r in [
+            record(ROOT, Role::RootTao, &["*"], None, vec![]),
+            record(
+                "https://one.example",
+                Role::Ti,
+                &[mdl],
+                Some(ROOT),
+                vec![b64(first.der())],
+            ),
+            record(
+                "https://two.example",
+                Role::Ti,
+                &[mdl],
+                Some(ROOT),
+                vec![b64(second.der())],
+            ),
+        ] {
+            registry.upsert(r, 1).unwrap();
+        }
+        let d = registry.check_x5c(&[leaf(&first, None, (2030, 1, 1))], mdl, NOW, None);
+        assert!(!d.trusted, "{d:?}");
+        assert!(d.reason.unwrap().contains("more than one party"));
     }
 
     #[test]
